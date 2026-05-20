@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vertex Updater — package and OS update manager for Vertex Linux."""
+"""Vertex Updater — package, OS, and tool update manager for Vertex Linux."""
 
 import sys
 import json
@@ -17,10 +17,19 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
+# ── OS update (GitHub commit-based) ──────────────────────────────────────────
 VERSION_FILE = Path("/etc/vertex-release")
-REPO        = "arc360alt/vertex-linux"
-API_URL     = f"https://api.github.com/repos/{REPO}/commits/main"
-UPDATE_URL  = f"https://raw.githubusercontent.com/{REPO}/main/update.sh"
+OS_REPO      = "Vertex-Linux/vertex-linux"
+OS_API_URL   = f"https://api.github.com/repos/{OS_REPO}/commits/main"
+OS_UPDATE_URL = f"https://raw.githubusercontent.com/{OS_REPO}/main/update.sh"
+
+# ── Tool repos ────────────────────────────────────────────────────────────────
+TOOLS_REPO      = "Vertex-Linux/vertex-tools"
+TOOLS_RAW       = f"https://raw.githubusercontent.com/{TOOLS_REPO}/main"
+DRIVERS_REPO    = "Vertex-Linux/vertex-graphics-installer"
+DRIVERS_API     = f"https://api.github.com/repos/{DRIVERS_REPO}/releases/latest"
+
+HEADERS = {"User-Agent": "VertexUpdater/1.1"}
 
 STYLESHEET = """
 QWidget {
@@ -92,17 +101,33 @@ def _read_version() -> str:
         return "unknown"
 
 
+def _vpkg_available() -> bool:
+    return Path("/usr/local/bin/vpkg").exists()
+
+
 def _detect_aur_helper() -> str | None:
-    for helper in ("yay", "paru"):
-        if subprocess.run(["which", helper], capture_output=True).returncode == 0:
-            return helper
+    for h in ("yay", "paru"):
+        if subprocess.run(["which", h], capture_output=True).returncode == 0:
+            return h
     return None
 
 
-# ── Background workers ────────────────────────────────────────────────────────
+def _fetch_json(url: str, timeout: int = 15) -> dict:
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def _fetch_bytes(url: str, timeout: int = 60) -> bytes:
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+# ── Workers ───────────────────────────────────────────────────────────────────
 
 class SequentialRunner(QThread):
-    """Run a list of commands sequentially, stream output line by line."""
+    """Run a list of commands sequentially, stream output."""
     line     = pyqtSignal(str)
     finished = pyqtSignal(int)
 
@@ -116,11 +141,8 @@ class SequentialRunner(QThread):
             self.line.emit(f"\n$ {' '.join(cmd)}")
             try:
                 proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
                 )
                 for ln in proc.stdout:
                     self.line.emit(ln.rstrip())
@@ -135,17 +157,13 @@ class SequentialRunner(QThread):
 
 
 class NetChecker(QThread):
-    """Fetch the latest commit info from GitHub."""
+    """Fetch the latest OS commit info from GitHub."""
     done  = pyqtSignal(dict)
     error = pyqtSignal(str)
 
     def run(self):
         try:
-            req = urllib.request.Request(
-                API_URL, headers={"User-Agent": "VertexUpdater/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=15) as r:
-                data = json.load(r)
+            data = _fetch_json(OS_API_URL)
             self.done.emit({
                 "sha":     data["sha"],
                 "short":   data["sha"][:8],
@@ -157,8 +175,8 @@ class NetChecker(QThread):
 
 
 class ScriptFetcher(QThread):
-    """Download update.sh from GitHub into a temp file."""
-    ready = pyqtSignal(str, str)   # (path, sha)
+    """Download update.sh into a temp file."""
+    ready = pyqtSignal(str, str)
     error = pyqtSignal(str)
 
     def __init__(self, sha: str):
@@ -167,12 +185,8 @@ class ScriptFetcher(QThread):
 
     def run(self):
         try:
-            req = urllib.request.Request(
-                UPDATE_URL, headers={"User-Agent": "VertexUpdater/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=30) as r:
-                content = r.read()
-            fd, path = tempfile.mkstemp(prefix="vertex-update-", suffix=".sh")
+            content = _fetch_bytes(OS_UPDATE_URL, timeout=30)
+            fd, path = tempfile.mkstemp(prefix="vertex-os-update-", suffix=".sh")
             os.write(fd, content)
             os.close(fd)
             os.chmod(path, 0o755)
@@ -181,18 +195,130 @@ class ScriptFetcher(QThread):
             self.error.emit(str(e))
 
 
+class ToolFetcher(QThread):
+    """Download vertex-drivers, vpkg, and/or vertex-update and install them."""
+    line     = pyqtSignal(str)
+    finished = pyqtSignal(int)   # 0 = success
+    self_updated = pyqtSignal()  # emitted when vertex-update itself was replaced
+
+    def __init__(self, do_drivers: bool, do_vpkg: bool, do_self: bool):
+        super().__init__()
+        self.do_drivers = do_drivers
+        self.do_vpkg    = do_vpkg
+        self.do_self    = do_self
+
+    def _emit(self, msg: str):
+        self.line.emit(msg)
+
+    def run(self):
+        tmpfiles: list[tuple[str, str]] = []   # (tmp_path, dest_path)
+        errors = 0
+
+        # ── vertex-drivers from latest GitHub release ─────────────────────────
+        if self.do_drivers:
+            self._emit("Fetching latest vertex-drivers release…")
+            try:
+                data    = _fetch_json(DRIVERS_API)
+                tag     = data["tag_name"]
+                asset_url = next(
+                    (a["browser_download_url"] for a in data.get("assets", [])
+                     if a["name"] == "vertex-drivers"),
+                    None,
+                )
+                if not asset_url:
+                    self._emit(f"  [error] No 'vertex-drivers' asset in release {tag}")
+                    errors += 1
+                else:
+                    self._emit(f"  Downloading vertex-drivers {tag}…")
+                    content = _fetch_bytes(asset_url)
+                    fd, tmp = tempfile.mkstemp(prefix="vertex-drivers-")
+                    os.write(fd, content)
+                    os.close(fd)
+                    tmpfiles.append((tmp, "/usr/local/bin/vertex-drivers"))
+                    self._emit(f"  vertex-drivers {tag} ready  ({len(content)//1024} KB)")
+            except Exception as e:
+                self._emit(f"  [error] vertex-drivers: {e}")
+                errors += 1
+
+        # ── vpkg from vertex-tools main branch ───────────────────────────────
+        if self.do_vpkg:
+            self._emit("Fetching latest vpkg…")
+            try:
+                content = _fetch_bytes(f"{TOOLS_RAW}/vpkg")
+                fd, tmp = tempfile.mkstemp(prefix="vertex-vpkg-")
+                os.write(fd, content)
+                os.close(fd)
+                tmpfiles.append((tmp, "/usr/local/bin/vpkg"))
+                self._emit(f"  vpkg ready  ({len(content)} bytes)")
+            except Exception as e:
+                self._emit(f"  [error] vpkg: {e}")
+                errors += 1
+
+        # ── vertex-update (self) from vertex-tools main branch ───────────────
+        if self.do_self:
+            self._emit("Fetching latest vertex-update…")
+            try:
+                content = _fetch_bytes(f"{TOOLS_RAW}/vertex-update")
+                fd, tmp = tempfile.mkstemp(prefix="vertex-update-")
+                os.write(fd, content)
+                os.close(fd)
+                tmpfiles.append((tmp, "/usr/local/bin/vertex-update"))
+                self._emit(f"  vertex-update ready  ({len(content)} bytes)")
+            except Exception as e:
+                self._emit(f"  [error] vertex-update: {e}")
+                errors += 1
+
+        if not tmpfiles:
+            self._emit("Nothing downloaded — cannot install.")
+            self.finished.emit(1)
+            return
+
+        # ── Install all files with a single pkexec call ───────────────────────
+        self._emit("\nInstalling with elevated privileges…")
+        cmds = " && ".join(
+            f"cp '{src}' '{dst}' && chmod 755 '{dst}'"
+            for src, dst in tmpfiles
+        )
+        proc = subprocess.Popen(
+            ["pkexec", "bash", "-c", cmds],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        for ln in proc.stdout:
+            self._emit(ln.rstrip())
+        proc.wait()
+
+        # Clean up temp files
+        for src, _ in tmpfiles:
+            try:
+                os.unlink(src)
+            except OSError:
+                pass
+
+        if proc.returncode == 0:
+            self._emit("\nAll tools installed successfully.")
+            installed_self = any(dst == "/usr/local/bin/vertex-update"
+                                 for _, dst in tmpfiles)
+            if installed_self:
+                self.self_updated.emit()
+        else:
+            self._emit(f"\n[install exited with code {proc.returncode}]")
+            errors += 1
+
+        self.finished.emit(0 if errors == 0 else 1)
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class VertexUpdater(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Vertex Updater")
-        self.setMinimumSize(820, 640)
+        self.setMinimumSize(860, 720)
         self._latest_info: dict | None = None
         self._update_sha  = ""
         self._busy        = False
         self._aur_helper  = _detect_aur_helper()
-        self._worker      = None   # keep QThread refs alive
+        self._worker      = None
         self._build_ui()
 
     def _build_ui(self):
@@ -200,14 +326,12 @@ class VertexUpdater(QMainWindow):
         self.setCentralWidget(root)
         lay = QVBoxLayout(root)
         lay.setContentsMargins(24, 18, 24, 18)
-        lay.setSpacing(14)
+        lay.setSpacing(12)
 
         # ── Header ────────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
         title = QLabel("Vertex Updater")
-        title.setStyleSheet(
-            "font-size: 22px; font-weight: bold; color: #A78BFA;"
-        )
+        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #A78BFA;")
         sub = QLabel("Keep your Vertex Linux system up to date")
         sub.setStyleSheet("color: #6D5FA0; font-size: 12px;")
         hdr.addWidget(title)
@@ -227,30 +351,61 @@ class VertexUpdater(QMainWindow):
         pkg_lay.setSpacing(8)
 
         self.chk_pacman  = QCheckBox("System packages  (pacman -Syu)")
-        self.chk_aur     = QCheckBox(
-            f"AUR packages  ({self._aur_helper})" if self._aur_helper
-            else "AUR packages  (yay / paru — not installed)"
-        )
         self.chk_flatpak = QCheckBox("Flatpak applications  (flatpak update)")
+
+        # AUR via vpkg if available, else direct helper
+        if _vpkg_available():
+            aur_label = "AUR packages  (via vpkg aur update)"
+        elif self._aur_helper:
+            aur_label = f"AUR packages  ({self._aur_helper})"
+        else:
+            aur_label = "AUR packages  (no helper found)"
+        self.chk_aur = QCheckBox(aur_label)
 
         for chk in (self.chk_pacman, self.chk_aur, self.chk_flatpak):
             chk.setChecked(True)
             pkg_lay.addWidget(chk)
 
-        if not self._aur_helper:
+        if not _vpkg_available() and not self._aur_helper:
             self.chk_aur.setChecked(False)
             self.chk_aur.setEnabled(False)
 
         self.btn_pkg = QPushButton("Update Packages")
-        row = QHBoxLayout()
-        row.addWidget(self.btn_pkg)
-        row.addStretch()
-        pkg_lay.addLayout(row)
+        r = QHBoxLayout()
+        r.addWidget(self.btn_pkg)
+        r.addStretch()
+        pkg_lay.addLayout(r)
         lay.addWidget(pkg_box)
         self.btn_pkg.clicked.connect(self._run_pkg_updates)
 
+        # ── Tool updates ──────────────────────────────────────────────────────
+        tool_box = QGroupBox("Vertex Tool Updates  (from GitHub)")
+        tool_lay = QVBoxLayout(tool_box)
+        tool_lay.setSpacing(8)
+
+        self.chk_drivers = QCheckBox(
+            "Vertex Driver Manager  (arc360alt/vertex-graphics-installer — latest release)"
+        )
+        self.chk_vpkg = QCheckBox(
+            "vpkg package manager  (arc360alt/vertex-tools)"
+        )
+        self.chk_self = QCheckBox(
+            "Vertex Updater itself  (arc360alt/vertex-tools)"
+        )
+        for chk in (self.chk_drivers, self.chk_vpkg, self.chk_self):
+            chk.setChecked(True)
+            tool_lay.addWidget(chk)
+
+        self.btn_tools = QPushButton("Update Tools")
+        tr = QHBoxLayout()
+        tr.addWidget(self.btn_tools)
+        tr.addStretch()
+        tool_lay.addLayout(tr)
+        lay.addWidget(tool_box)
+        self.btn_tools.clicked.connect(self._run_tool_updates)
+
         # ── OS update ─────────────────────────────────────────────────────────
-        os_box = QGroupBox("OS Update  (syncs from GitHub commits)")
+        os_box = QGroupBox("OS Update  (syncs system config from GitHub commits)")
         os_lay = QVBoxLayout(os_box)
         os_lay.setSpacing(8)
 
@@ -272,10 +427,10 @@ class VertexUpdater(QMainWindow):
         os_lay.addWidget(self.lbl_msg)
 
         os_btn_row = QHBoxLayout()
-        self.btn_check  = QPushButton("Check for Updates")
+        self.btn_check = QPushButton("Check for Updates")
         self.btn_check.setProperty("secondary", True)
         self.btn_check.style().polish(self.btn_check)
-        self.btn_apply  = QPushButton("Apply OS Update")
+        self.btn_apply = QPushButton("Apply OS Update")
         self.btn_apply.setEnabled(False)
         os_btn_row.addWidget(self.btn_check)
         os_btn_row.addSpacing(10)
@@ -294,7 +449,7 @@ class VertexUpdater(QMainWindow):
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(180)
+        self.log.setMinimumHeight(160)
         lay.addWidget(self.log)
 
         self.lbl_status = QLabel("Ready.")
@@ -306,13 +461,16 @@ class VertexUpdater(QMainWindow):
     def _run_pkg_updates(self):
         if self._busy:
             return
-        cmds = []
+        cmds: list[list[str]] = []
         if self.chk_pacman.isChecked():
             cmds.append(["pkexec", "pacman", "-Syu", "--noconfirm"])
-        if self.chk_aur.isChecked() and self._aur_helper:
-            cmds.append([self._aur_helper, "-Syu", "--noconfirm"])
+        if self.chk_aur.isChecked():
+            if _vpkg_available():
+                cmds.append(["/usr/local/bin/vpkg", "aur", "update", "--noconfirm"])
+            elif self._aur_helper:
+                cmds.append([self._aur_helper, "-Syu", "--noconfirm"])
         if self.chk_flatpak.isChecked():
-            cmds.append(["flatpak", "update", "--noninteractive"])
+            cmds.append(["pkexec", "flatpak", "update", "--noninteractive"])
         if not cmds:
             self._log("Nothing selected.")
             return
@@ -329,6 +487,39 @@ class VertexUpdater(QMainWindow):
             self._status("Package updates complete.", "ok")
         else:
             self._status(f"Finished with errors (exit {rc}).", "warn")
+
+    # ── Tool update flow ──────────────────────────────────────────────────────
+
+    def _run_tool_updates(self):
+        if self._busy:
+            return
+        do_drivers = self.chk_drivers.isChecked()
+        do_vpkg    = self.chk_vpkg.isChecked()
+        do_self    = self.chk_self.isChecked()
+        if not any([do_drivers, do_vpkg, do_self]):
+            self._log("No tools selected.")
+            return
+        self._set_busy(True)
+        self._status("Downloading tool updates…")
+        self._log("=== Vertex Tool Updates ===")
+        self._worker = ToolFetcher(do_drivers, do_vpkg, do_self)
+        self._worker.line.connect(self._log)
+        self._worker.finished.connect(self._on_tools_done)
+        self._worker.self_updated.connect(self._on_self_updated)
+        self._worker.start()
+
+    def _on_tools_done(self, rc: int):
+        self._set_busy(False)
+        if rc == 0:
+            self._status("Tool updates applied.", "ok")
+        else:
+            self._status("Tool update finished with errors — check log.", "warn")
+
+    def _on_self_updated(self):
+        self._log(
+            "\n  Vertex Updater was replaced on disk.\n"
+            "  Close and relaunch this app to run the new version."
+        )
 
     # ── OS update flow ────────────────────────────────────────────────────────
 
@@ -352,7 +543,6 @@ class VertexUpdater(QMainWindow):
         self.lbl_cur.setText(current)
         self.lbl_new.setText(f"{info['short']}  ({info['date']})")
         self.lbl_msg.setText(info["message"])
-
         up_to_date = (current != "unknown" and current == info["sha"])
         if up_to_date:
             self.lbl_new.setStyleSheet("font-family: monospace; color: #6D5FA0;")
@@ -372,7 +562,7 @@ class VertexUpdater(QMainWindow):
         if self._busy or not self._latest_info:
             return
         self._set_busy(True)
-        self._log("=== Downloading OS update script from GitHub…")
+        self._log("=== Downloading OS update script…")
         self._worker = ScriptFetcher(self._latest_info["sha"])
         self._worker.ready.connect(self._on_script_ready)
         self._worker.error.connect(self._on_script_error)
@@ -380,15 +570,10 @@ class VertexUpdater(QMainWindow):
 
     def _on_script_ready(self, path: str, sha: str):
         self._update_sha = sha
-        self._log(f"Script downloaded to {path}. Running with elevated privileges…")
-        # write-version command: run after the update script succeeds
-        write_ver = [
-            "pkexec", "bash", "-c",
-            f"echo '{sha}' > /etc/vertex-release"
-        ]
+        self._log(f"Script downloaded. Running with elevated privileges…")
         self._worker = SequentialRunner([
             ["pkexec", "bash", path],
-            write_ver,
+            ["pkexec", "bash", "-c", f"echo '{sha}' > /etc/vertex-release"],
         ])
         self._worker.line.connect(self._log)
         self._worker.finished.connect(self._on_os_done)
@@ -411,28 +596,26 @@ class VertexUpdater(QMainWindow):
 
     def _log(self, text: str):
         self.log.append(text)
-        sb = self.log.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self.log.verticalScrollBar().setValue(
+            self.log.verticalScrollBar().maximum()
+        )
 
     def _status(self, text: str, level: str = ""):
-        colors = {
-            "ok":    "#34D399",
-            "warn":  "#F59E0B",
-            "error": "#F87171",
-            "":      "#6D5FA0",
-        }
-        color = colors.get(level, "#6D5FA0")
-        self.lbl_status.setStyleSheet(f"color: {color}; font-size: 12px;")
+        colors = {"ok": "#34D399", "warn": "#F59E0B", "error": "#F87171", "": "#6D5FA0"}
+        self.lbl_status.setStyleSheet(
+            f"color: {colors.get(level, '#6D5FA0')}; font-size: 12px;"
+        )
         self.lbl_status.setText(text)
 
     def _set_busy(self, busy: bool):
         self._busy = busy
-        for btn in (self.btn_pkg, self.btn_check, self.btn_apply):
+        for btn in (self.btn_pkg, self.btn_tools, self.btn_check, self.btn_apply):
             btn.setEnabled(not busy)
         if not busy and self._latest_info:
             current = _read_version()
-            up_to_date = (current != "unknown" and current == self._latest_info["sha"])
-            self.btn_apply.setEnabled(not up_to_date)
+            self.btn_apply.setEnabled(
+                current == "unknown" or current != self._latest_info["sha"]
+            )
 
 
 def main():
