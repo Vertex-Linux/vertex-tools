@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""Vertex Updater — package and OS update manager for Vertex Linux."""
+
+import sys
+import json
+import os
+import subprocess
+import tempfile
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QTextEdit, QGroupBox, QCheckBox, QFrame,
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QFont
+
+VERSION_FILE = Path("/etc/vertex-release")
+REPO        = "arc360alt/vertex-linux"
+API_URL     = f"https://api.github.com/repos/{REPO}/commits/main"
+UPDATE_URL  = f"https://raw.githubusercontent.com/{REPO}/main/update.sh"
+
+STYLESHEET = """
+QWidget {
+    background-color: #0F0820;
+    color: #DDD6FE;
+    font-family: "Noto Sans", "Segoe UI", sans-serif;
+    font-size: 13px;
+}
+QMainWindow { background-color: #0F0820; }
+QGroupBox {
+    border: 1px solid #3B1F7A;
+    border-radius: 8px;
+    margin-top: 16px;
+    padding: 12px 8px 8px 8px;
+    color: #A78BFA;
+    font-weight: bold;
+    font-size: 13px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 6px;
+}
+QPushButton {
+    background-color: #5B21B6;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 20px;
+    font-weight: 600;
+    font-size: 13px;
+    min-width: 100px;
+}
+QPushButton:hover   { background-color: #6D28D9; }
+QPushButton:pressed { background-color: #4C1D95; }
+QPushButton:disabled { background-color: #271150; color: #6B5C9E; }
+QPushButton[secondary="true"] {
+    background-color: #1E0D3C;
+    border: 1px solid #5B21B6;
+    color: #C4B5FD;
+}
+QPushButton[secondary="true"]:hover { background-color: #2D1B69; }
+QCheckBox { color: #C4B5FD; spacing: 8px; }
+QCheckBox::indicator {
+    width: 16px; height: 16px;
+    border-radius: 4px; border: 2px solid #5B21B6;
+    background: #1A0B2E;
+}
+QCheckBox::indicator:checked { background: #7C3AED; }
+QTextEdit {
+    background-color: #080514;
+    color: #A78BFA;
+    border: 1px solid #2D1B69;
+    border-radius: 6px;
+    font-family: monospace;
+    font-size: 12px;
+    padding: 4px;
+}
+QLabel { color: #DDD6FE; }
+"""
+
+
+def _read_version() -> str:
+    try:
+        v = VERSION_FILE.read_text().strip()
+        return v if v else "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _detect_aur_helper() -> str | None:
+    for helper in ("yay", "paru"):
+        if subprocess.run(["which", helper], capture_output=True).returncode == 0:
+            return helper
+    return None
+
+
+# ── Background workers ────────────────────────────────────────────────────────
+
+class SequentialRunner(QThread):
+    """Run a list of commands sequentially, stream output line by line."""
+    line     = pyqtSignal(str)
+    finished = pyqtSignal(int)
+
+    def __init__(self, commands: list[list[str]]):
+        super().__init__()
+        self.commands = commands
+
+    def run(self):
+        last_rc = 0
+        for cmd in self.commands:
+            self.line.emit(f"\n$ {' '.join(cmd)}")
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                for ln in proc.stdout:
+                    self.line.emit(ln.rstrip())
+                proc.wait()
+                last_rc = proc.returncode
+                if last_rc != 0:
+                    self.line.emit(f"[exited with code {last_rc}]")
+            except FileNotFoundError as e:
+                self.line.emit(f"[error: {e}]")
+                last_rc = 1
+        self.finished.emit(last_rc)
+
+
+class NetChecker(QThread):
+    """Fetch the latest commit info from GitHub."""
+    done  = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def run(self):
+        try:
+            req = urllib.request.Request(
+                API_URL, headers={"User-Agent": "VertexUpdater/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.load(r)
+            self.done.emit({
+                "sha":     data["sha"],
+                "short":   data["sha"][:8],
+                "message": data["commit"]["message"].split("\n")[0],
+                "date":    data["commit"]["author"]["date"][:10],
+            })
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class ScriptFetcher(QThread):
+    """Download update.sh from GitHub into a temp file."""
+    ready = pyqtSignal(str, str)   # (path, sha)
+    error = pyqtSignal(str)
+
+    def __init__(self, sha: str):
+        super().__init__()
+        self.sha = sha
+
+    def run(self):
+        try:
+            req = urllib.request.Request(
+                UPDATE_URL, headers={"User-Agent": "VertexUpdater/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                content = r.read()
+            fd, path = tempfile.mkstemp(prefix="vertex-update-", suffix=".sh")
+            os.write(fd, content)
+            os.close(fd)
+            os.chmod(path, 0o755)
+            self.ready.emit(path, self.sha)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ── Main window ───────────────────────────────────────────────────────────────
+
+class VertexUpdater(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Vertex Updater")
+        self.setMinimumSize(820, 640)
+        self._latest_info: dict | None = None
+        self._update_sha  = ""
+        self._busy        = False
+        self._aur_helper  = _detect_aur_helper()
+        self._worker      = None   # keep QThread refs alive
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(24, 18, 24, 18)
+        lay.setSpacing(14)
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        title = QLabel("Vertex Updater")
+        title.setStyleSheet(
+            "font-size: 22px; font-weight: bold; color: #A78BFA;"
+        )
+        sub = QLabel("Keep your Vertex Linux system up to date")
+        sub.setStyleSheet("color: #6D5FA0; font-size: 12px;")
+        hdr.addWidget(title)
+        hdr.addSpacing(14)
+        hdr.addWidget(sub, alignment=Qt.AlignmentFlag.AlignVCenter)
+        hdr.addStretch()
+        lay.addLayout(hdr)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #2D1B69;")
+        lay.addWidget(sep)
+
+        # ── Package updates ───────────────────────────────────────────────────
+        pkg_box = QGroupBox("Package Updates")
+        pkg_lay = QVBoxLayout(pkg_box)
+        pkg_lay.setSpacing(8)
+
+        self.chk_pacman  = QCheckBox("System packages  (pacman -Syu)")
+        self.chk_aur     = QCheckBox(
+            f"AUR packages  ({self._aur_helper})" if self._aur_helper
+            else "AUR packages  (yay / paru — not installed)"
+        )
+        self.chk_flatpak = QCheckBox("Flatpak applications  (flatpak update)")
+
+        for chk in (self.chk_pacman, self.chk_aur, self.chk_flatpak):
+            chk.setChecked(True)
+            pkg_lay.addWidget(chk)
+
+        if not self._aur_helper:
+            self.chk_aur.setChecked(False)
+            self.chk_aur.setEnabled(False)
+
+        self.btn_pkg = QPushButton("Update Packages")
+        row = QHBoxLayout()
+        row.addWidget(self.btn_pkg)
+        row.addStretch()
+        pkg_lay.addLayout(row)
+        lay.addWidget(pkg_box)
+        self.btn_pkg.clicked.connect(self._run_pkg_updates)
+
+        # ── OS update ─────────────────────────────────────────────────────────
+        os_box = QGroupBox("OS Update  (syncs from GitHub commits)")
+        os_lay = QVBoxLayout(os_box)
+        os_lay.setSpacing(8)
+
+        ver_row = QHBoxLayout()
+        ver_row.addWidget(QLabel("Installed:"))
+        self.lbl_cur = QLabel(_read_version())
+        self.lbl_cur.setStyleSheet("font-family: monospace; color: #7C6BAC;")
+        ver_row.addWidget(self.lbl_cur)
+        ver_row.addSpacing(28)
+        ver_row.addWidget(QLabel("Latest:"))
+        self.lbl_new = QLabel("(not checked)")
+        self.lbl_new.setStyleSheet("font-family: monospace; color: #6D5FA0;")
+        ver_row.addWidget(self.lbl_new)
+        ver_row.addStretch()
+        os_lay.addLayout(ver_row)
+
+        self.lbl_msg = QLabel("")
+        self.lbl_msg.setStyleSheet("color: #7C6BAC; font-style: italic;")
+        os_lay.addWidget(self.lbl_msg)
+
+        os_btn_row = QHBoxLayout()
+        self.btn_check  = QPushButton("Check for Updates")
+        self.btn_check.setProperty("secondary", True)
+        self.btn_check.style().polish(self.btn_check)
+        self.btn_apply  = QPushButton("Apply OS Update")
+        self.btn_apply.setEnabled(False)
+        os_btn_row.addWidget(self.btn_check)
+        os_btn_row.addSpacing(10)
+        os_btn_row.addWidget(self.btn_apply)
+        os_btn_row.addStretch()
+        os_lay.addLayout(os_btn_row)
+        lay.addWidget(os_box)
+
+        self.btn_check.clicked.connect(self._check_os)
+        self.btn_apply.clicked.connect(self._run_os_update)
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        lbl_log = QLabel("Output Log")
+        lbl_log.setStyleSheet("color: #6D5FA0; font-size: 11px; font-weight: bold;")
+        lay.addWidget(lbl_log)
+
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(180)
+        lay.addWidget(self.log)
+
+        self.lbl_status = QLabel("Ready.")
+        self.lbl_status.setStyleSheet("color: #6D5FA0; font-size: 12px;")
+        lay.addWidget(self.lbl_status)
+
+    # ── Package update flow ───────────────────────────────────────────────────
+
+    def _run_pkg_updates(self):
+        if self._busy:
+            return
+        cmds = []
+        if self.chk_pacman.isChecked():
+            cmds.append(["pkexec", "pacman", "-Syu", "--noconfirm"])
+        if self.chk_aur.isChecked() and self._aur_helper:
+            cmds.append([self._aur_helper, "-Syu", "--noconfirm"])
+        if self.chk_flatpak.isChecked():
+            cmds.append(["flatpak", "update", "--noninteractive"])
+        if not cmds:
+            self._log("Nothing selected.")
+            return
+        self._set_busy(True)
+        self._status("Updating packages…")
+        self._worker = SequentialRunner(cmds)
+        self._worker.line.connect(self._log)
+        self._worker.finished.connect(self._on_pkg_done)
+        self._worker.start()
+
+    def _on_pkg_done(self, rc: int):
+        self._set_busy(False)
+        if rc == 0:
+            self._status("Package updates complete.", "ok")
+        else:
+            self._status(f"Finished with errors (exit {rc}).", "warn")
+
+    # ── OS update flow ────────────────────────────────────────────────────────
+
+    def _check_os(self):
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status("Checking for OS updates…")
+        self.lbl_new.setText("checking…")
+        self.lbl_new.setStyleSheet("font-family: monospace; color: #6D5FA0;")
+        self.btn_apply.setEnabled(False)
+        self._worker = NetChecker()
+        self._worker.done.connect(self._on_check_done)
+        self._worker.error.connect(self._on_check_error)
+        self._worker.start()
+
+    def _on_check_done(self, info: dict):
+        self._set_busy(False)
+        self._latest_info = info
+        current = _read_version()
+        self.lbl_cur.setText(current)
+        self.lbl_new.setText(f"{info['short']}  ({info['date']})")
+        self.lbl_msg.setText(info["message"])
+
+        up_to_date = (current != "unknown" and current == info["sha"])
+        if up_to_date:
+            self.lbl_new.setStyleSheet("font-family: monospace; color: #6D5FA0;")
+            self._status("OS is up to date.", "ok")
+            self.btn_apply.setEnabled(False)
+        else:
+            self.lbl_new.setStyleSheet("font-family: monospace; color: #34D399;")
+            self._status("OS update available!", "ok")
+            self.btn_apply.setEnabled(True)
+
+    def _on_check_error(self, msg: str):
+        self._set_busy(False)
+        self.lbl_new.setText("error")
+        self._status(f"Could not check for updates: {msg}", "error")
+
+    def _run_os_update(self):
+        if self._busy or not self._latest_info:
+            return
+        self._set_busy(True)
+        self._log("=== Downloading OS update script from GitHub…")
+        self._worker = ScriptFetcher(self._latest_info["sha"])
+        self._worker.ready.connect(self._on_script_ready)
+        self._worker.error.connect(self._on_script_error)
+        self._worker.start()
+
+    def _on_script_ready(self, path: str, sha: str):
+        self._update_sha = sha
+        self._log(f"Script downloaded to {path}. Running with elevated privileges…")
+        # write-version command: run after the update script succeeds
+        write_ver = [
+            "pkexec", "bash", "-c",
+            f"echo '{sha}' > /etc/vertex-release"
+        ]
+        self._worker = SequentialRunner([
+            ["pkexec", "bash", path],
+            write_ver,
+        ])
+        self._worker.line.connect(self._log)
+        self._worker.finished.connect(self._on_os_done)
+        self._worker.start()
+
+    def _on_script_error(self, msg: str):
+        self._set_busy(False)
+        self._status(f"Download failed: {msg}", "error")
+
+    def _on_os_done(self, rc: int):
+        self._set_busy(False)
+        if rc == 0:
+            self.lbl_cur.setText(self._update_sha[:8])
+            self.btn_apply.setEnabled(False)
+            self._status("OS update applied successfully!", "ok")
+        else:
+            self._status(f"OS update finished with errors (exit {rc}).", "warn")
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _log(self, text: str):
+        self.log.append(text)
+        sb = self.log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _status(self, text: str, level: str = ""):
+        colors = {
+            "ok":    "#34D399",
+            "warn":  "#F59E0B",
+            "error": "#F87171",
+            "":      "#6D5FA0",
+        }
+        color = colors.get(level, "#6D5FA0")
+        self.lbl_status.setStyleSheet(f"color: {color}; font-size: 12px;")
+        self.lbl_status.setText(text)
+
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        for btn in (self.btn_pkg, self.btn_check, self.btn_apply):
+            btn.setEnabled(not busy)
+        if not busy and self._latest_info:
+            current = _read_version()
+            up_to_date = (current != "unknown" and current == self._latest_info["sha"])
+            self.btn_apply.setEnabled(not up_to_date)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyleSheet(STYLESHEET)
+    app.setApplicationName("Vertex Updater")
+    win = VertexUpdater()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

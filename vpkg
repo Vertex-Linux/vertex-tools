@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  vpkg — Vertex Pkg | Package Manager for Vertex Linux
+#  Manages Flatpak, Pacman, and AUR packages with a unified CLI.
+#  Zero extra dependencies — uses only tools pre-installed on Arch/Vertex Linux.
+#
+#  Usage:
+#    vpkg <backend> <command> [args…]
+#
+#  Backends:  fp (Flatpak)  |  pm (Pacman)  |  aur (AUR)
+#
+#  Commands:
+#    install   <pkg…>     Install one or more packages
+#    uninstall <pkg…>     Remove one or more packages
+#    search    <query>    Search available packages
+#    update    [pkg…]     Update packages (all if none specified)
+#    info      <pkg>      Show detailed package information
+#    list                 List installed packages
+#    clean                Clean cache / orphans
+#    owns      <file>     Which package owns a file (pm/aur only)
+#    history              Show vpkg operation log
+#    version              Print vpkg version
+#    help                 Show this help
+# =============================================================================
+
+readonly VPKG_VERSION="1.1.0"
+readonly VPKG_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/vpkg"
+readonly VPKG_LOG="$VPKG_CACHE_DIR/vpkg.log"
+
+# Capture original args before any shifting — used for sudo re-exec
+VPKG_ORIG_ARGS=("$@")
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    BOLD="\033[1m";   DIM="\033[2m";    RESET="\033[0m"
+    RED="\033[1;31m"; GREEN="\033[1;32m"; YELLOW="\033[1;33m"
+    CYAN="\033[1;36m"; BLUE="\033[1;34m"; WHITE="\033[1;37m"
+else
+    BOLD=""; DIM=""; RESET=""
+    RED=""; GREEN=""; YELLOW=""
+    CYAN=""; BLUE=""; WHITE=""
+fi
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+_log()  { mkdir -p "$VPKG_CACHE_DIR"; echo "[$(date '+%F %T')] $*" >> "$VPKG_LOG"; }
+_die()  { echo -e "${RED}[ERR]${RESET}  $*" >&2; _log "ERROR: $*"; exit 1; }
+_warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+_info() { echo -e "${CYAN}[INFO]${RESET} $*"; }
+_ok()   { echo -e "${GREEN}[ OK ]${RESET} $*"; _log "OK: $*"; }
+_step() { echo -e "\n${BOLD}${BLUE}▶  $*${RESET}"; }
+_sep()  { echo -e "${DIM}────────────────────────────────────────────────${RESET}"; }
+
+_confirm() {
+    echo -ne "${YELLOW}$1 [y/N]${RESET} "
+    read -r _ans
+    [[ "${_ans,,}" == "y" || "${_ans,,}" == "yes" ]]
+}
+
+_auto_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${YELLOW}[sudo]${RESET} Elevating privileges…"
+        exec sudo "$0" "${VPKG_ORIG_ARGS[@]}"
+    fi
+}
+
+_no_root() {
+    [[ $EUID -ne 0 ]] || _die "Do not run AUR operations as root — they must run as a normal user."
+}
+
+_require() {
+    command -v "$1" &>/dev/null || _die "'$1' is not installed or not in PATH."
+}
+
+_detect_aur_helper() {
+    for h in yay paru aurman trizen; do
+        command -v "$h" &>/dev/null && { echo "$h"; return; }
+    done
+    echo ""
+}
+
+_banner() {
+    echo -e "${CYAN}${BOLD}"
+    cat << 'EOF'
+  ██╗   ██╗██████╗ ██╗  ██╗ ██████╗
+  ██║   ██║██╔══██╗██║ ██╔╝██╔════╝
+  ██║   ██║██████╔╝█████╔╝ ██║  ███╗
+  ╚██╗ ██╔╝██╔═══╝ ██╔═██╗ ██║   ██║
+   ╚████╔╝ ██║     ██║  ██╗╚██████╔╝
+    ╚═══╝  ╚═╝     ╚═╝  ╚═╝ ╚═════╝
+EOF
+    echo -e "${WHITE}  Vertex Pkg ${DIM}v${VPKG_VERSION}${RESET}${WHITE} — Vertex Linux Package Manager${RESET}"
+    echo -e "${DIM}  Flatpak (fp)  ·  Pacman (pm)  ·  AUR (aur)${RESET}\n"
+}
+
+# =============================================================================
+#  FLATPAK — vpkg fp <command>
+# =============================================================================
+
+cmd_fp() {
+    _require flatpak
+    local cmd="$1"; shift
+
+    case "$cmd" in
+        install)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg fp install <app-id> [app-id…]"
+            _auto_root
+            _step "Installing Flatpak: ${WHITE}$*${RESET}"
+            # Ensure flathub is registered (system-level)
+            flatpak remote-add --if-not-exists flathub \
+                https://dl.flathub.org/repo/flathub.flatpakrepo &>/dev/null || true
+            flatpak install -y flathub "$@" \
+                && { _ok "Installed: $*"; _log "fp install $*"; } \
+                || _die "Flatpak install failed."
+            ;;
+
+        uninstall|remove)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg fp uninstall <app-id> [app-id…]"
+            _auto_root
+            _confirm "Uninstall Flatpak package(s): $*?" || { _info "Aborted."; exit 0; }
+            _step "Uninstalling Flatpak: ${WHITE}$*${RESET}"
+            flatpak uninstall -y "$@" \
+                && { _ok "Uninstalled: $*"; _log "fp uninstall $*"; } \
+                || _die "Flatpak uninstall failed."
+            ;;
+
+        search)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg fp search <query>"
+            _step "Searching Flatpak for: ${WHITE}$*${RESET}"
+            flatpak search "$@"
+            ;;
+
+        update|upgrade)
+            _auto_root
+            _step "Updating Flatpak packages…"
+            flatpak update -y "$@" \
+                && { _ok "Flatpak packages up to date."; _log "fp update"; } \
+                || _die "Flatpak update failed."
+            ;;
+
+        info)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg fp info <app-id>"
+            _step "Info — ${WHITE}$1${RESET}"
+            flatpak info "$1"
+            ;;
+
+        list)
+            _step "Installed Flatpak packages"
+            _sep
+            flatpak list --columns=application,name,version,branch
+            ;;
+
+        clean)
+            _auto_root
+            _step "Removing unused Flatpak runtimes…"
+            flatpak uninstall --unused -y \
+                && { _ok "Flatpak cache cleaned."; _log "fp clean"; } \
+                || _warn "Nothing to clean or operation failed."
+            ;;
+
+        remotes)
+            _step "Configured Flatpak remotes"
+            _sep
+            flatpak remotes
+            ;;
+
+        add-remote)
+            [[ $# -ge 2 ]] || _die "Usage: vpkg fp add-remote <name> <url>"
+            _auto_root
+            _step "Adding remote: ${WHITE}$1${RESET} → $2"
+            flatpak remote-add --if-not-exists "$1" "$2" \
+                && { _ok "Remote '$1' added."; _log "fp add-remote $1 $2"; } \
+                || _die "Failed to add remote."
+            ;;
+
+        help)
+            echo -e "\n${BOLD}vpkg fp${RESET} — Flatpak backend\n"
+            printf "  ${WHITE}%-14s${RESET} %s\n" \
+                "install"    "Install a Flatpak app (e.g. com.spotify.Client)" \
+                "uninstall"  "Remove a Flatpak app" \
+                "search"     "Search Flatpak remotes" \
+                "update"     "Update all Flatpak apps" \
+                "info"       "Show info for a Flatpak app" \
+                "list"       "List installed Flatpak apps" \
+                "clean"      "Remove unused runtimes" \
+                "remotes"    "List configured remotes" \
+                "add-remote" "Add a new remote (name url)"
+            echo ""
+            ;;
+
+        *)
+            _die "Unknown fp command: '$cmd'. Run 'vpkg fp help'."
+            ;;
+    esac
+}
+
+# =============================================================================
+#  PACMAN — vpkg pm <command>
+# =============================================================================
+
+cmd_pm() {
+    _require pacman
+    local cmd="$1"; shift
+
+    case "$cmd" in
+        install)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg pm install <pkg> [pkg…]"
+            _auto_root
+            _step "Installing via Pacman: ${WHITE}$*${RESET}"
+            pacman -S --needed "$@" \
+                && { _ok "Installed: $*"; _log "pm install $*"; } \
+                || _die "Pacman install failed."
+            ;;
+
+        uninstall|remove)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg pm uninstall <pkg> [pkg…]"
+            _auto_root
+            _confirm "Uninstall (with deps): $*?" || { _info "Aborted."; exit 0; }
+            _step "Uninstalling via Pacman: ${WHITE}$*${RESET}"
+            pacman -Rns "$@" \
+                && { _ok "Uninstalled: $*"; _log "pm uninstall $*"; } \
+                || _die "Pacman uninstall failed."
+            ;;
+
+        search)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg pm search <query>"
+            _step "Searching Pacman repos for: ${WHITE}$*${RESET}"
+            pacman -Ss "$@"
+            ;;
+
+        update|upgrade)
+            _auto_root
+            _step "Syncing and upgrading system packages…"
+            pacman -Syu "$@" \
+                && { _ok "System up to date."; _log "pm update"; } \
+                || _die "Pacman update failed."
+            ;;
+
+        info)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg pm info <pkg>"
+            _step "Info — ${WHITE}$1${RESET}"
+            pacman -Si "$1" 2>/dev/null || pacman -Qi "$1" 2>/dev/null \
+                || _die "Package '$1' not found."
+            ;;
+
+        list)
+            _step "Explicitly installed packages (not as deps)"
+            _sep
+            pacman -Qe
+            ;;
+
+        list-all)
+            _step "All installed packages"
+            _sep
+            pacman -Q
+            ;;
+
+        clean)
+            _auto_root
+            _step "Cleaning Pacman cache (keeping last 2 versions)…"
+            # paccache is in pacman-contrib; fall back to pacman -Sc if absent
+            if command -v paccache &>/dev/null; then
+                paccache -rk2
+            else
+                pacman -Sc --noconfirm
+            fi
+            _step "Checking for orphaned packages…"
+            local orphans
+            orphans=$(pacman -Qdtq 2>/dev/null)
+            if [[ -n "$orphans" ]]; then
+                echo "$orphans"
+                _confirm "Remove the above orphans?" \
+                    && pacman -Rns $orphans \
+                    && _ok "Orphans removed." \
+                    || _info "Skipped orphan removal."
+            else
+                _info "No orphans found."
+            fi
+            _log "pm clean"
+            ;;
+
+        owns)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg pm owns <file>"
+            _step "Checking owner of: ${WHITE}$1${RESET}"
+            pacman -Qo "$1"
+            ;;
+
+        sync)
+            _auto_root
+            _step "Syncing package databases…"
+            pacman -Sy \
+                && { _ok "Databases synced."; _log "pm sync"; } \
+                || _die "Sync failed."
+            ;;
+
+        help)
+            echo -e "\n${BOLD}vpkg pm${RESET} — Pacman backend\n"
+            printf "  ${WHITE}%-14s${RESET} %s\n" \
+                "install"    "Install from official repos" \
+                "uninstall"  "Remove package and its deps" \
+                "search"     "Search official repos" \
+                "update"     "Full system upgrade (-Syu)" \
+                "sync"       "Sync package databases only (-Sy)" \
+                "info"       "Show package info" \
+                "list"       "List explicitly installed packages" \
+                "list-all"   "List all installed packages" \
+                "clean"      "Clean cache and remove orphans" \
+                "owns"       "Show which package owns a file"
+            echo ""
+            ;;
+
+        *)
+            _die "Unknown pm command: '$cmd'. Run 'vpkg pm help'."
+            ;;
+    esac
+}
+
+# =============================================================================
+#  AUR — vpkg aur <command>
+# =============================================================================
+
+cmd_aur() {
+    _no_root
+    local AUR_HELPER
+    AUR_HELPER=$(_detect_aur_helper)
+    local cmd="$1"; shift
+
+    # Fallback: manual git + makepkg install
+    _aur_makepkg_install() {
+        local pkg="$1"
+        _require git
+        local tmpdir
+        tmpdir=$(mktemp -d /tmp/vpkg-aur-XXXXXX)
+        _info "Cloning AUR: https://aur.archlinux.org/${pkg}.git"
+        git clone "https://aur.archlinux.org/${pkg}.git" "$tmpdir/$pkg" \
+            || _die "Failed to clone AUR package '$pkg'. Does it exist?"
+        pushd "$tmpdir/$pkg" > /dev/null
+        _info "Building with makepkg…"
+        makepkg -si --needed \
+            && _ok "Installed AUR package: $pkg" \
+            || _die "makepkg build/install failed."
+        popd > /dev/null
+        rm -rf "$tmpdir"
+        _log "aur install (makepkg) $pkg"
+    }
+
+    # AUR RPC search — uses Python (installed on Vertex Linux) for clean output
+    _aur_rpc_search() {
+        _require curl
+        local query="$1"
+        _step "Searching AUR for: ${WHITE}${query}${RESET}"
+        _sep
+        local raw
+        raw=$(curl -fsSL "https://aur.archlinux.org/rpc/v5/search/${query}?by=name-desc") \
+            || _die "AUR RPC request failed. Check your connection."
+        echo "$raw" | python3 << 'PYEOF'
+import sys, json
+
+BOLD  = "\033[1m";  DIM    = "\033[2m";  RESET = "\033[0m"
+CYAN  = "\033[1;36m"; YELLOW = "\033[1;33m"; GREEN = "\033[1;32m"
+RED   = "\033[1;31m"; WHITE  = "\033[1;37m"; GRAY  = "\033[0;37m"
+
+try:
+    data = json.load(sys.stdin)
+except Exception as e:
+    print(f"  Parse error: {e}", file=sys.stderr); sys.exit(1)
+
+results = data.get("results", [])
+if not results:
+    print("  No results found."); sys.exit(0)
+
+results.sort(key=lambda x: x.get("NumVotes", 0), reverse=True)
+total  = len(results)
+show   = min(total, 25)
+
+print(f"  {GRAY}Found {total} result(s) — showing top {show}, sorted by votes{RESET}\n")
+
+for pkg in results[:show]:
+    name    = pkg.get("Name", "?")
+    ver     = pkg.get("Version", "?")
+    votes   = pkg.get("NumVotes", 0)
+    pop     = pkg.get("Popularity", 0.0)
+    desc    = (pkg.get("Description") or "(no description)")[:80]
+    maint   = pkg.get("Maintainer") or "orphan"
+    ood     = f"  {RED}[OUT OF DATE]{RESET}" if pkg.get("OutOfDate") else ""
+
+    stars   = min(int(pop), 5)
+    bar     = "★" * stars + "☆" * (5 - stars)
+
+    print(f"  {CYAN}{BOLD}{name}{RESET}  {DIM}{ver}{RESET}  "
+          f"{YELLOW}{bar}{RESET}  {GRAY}{votes} votes{RESET}{ood}")
+    print(f"  {desc}")
+    print(f"  {DIM}Maintainer: {maint}{RESET}")
+    print()
+PYEOF
+    }
+
+    case "$cmd" in
+        install)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg aur install <pkg> [pkg…]"
+            _step "Installing from AUR: ${WHITE}$*${RESET}"
+            if [[ -n "$AUR_HELPER" ]]; then
+                _info "Using AUR helper: $AUR_HELPER"
+                "$AUR_HELPER" -S --needed "$@" \
+                    && { _ok "Installed: $*"; _log "aur install ($AUR_HELPER) $*"; } \
+                    || _die "AUR install failed."
+            else
+                _warn "No AUR helper found — falling back to git + makepkg."
+                for pkg in "$@"; do
+                    _aur_makepkg_install "$pkg"
+                done
+            fi
+            ;;
+
+        uninstall|remove)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg aur uninstall <pkg> [pkg…]"
+            _require pacman
+            _confirm "Uninstall AUR package(s): $*?" || { _info "Aborted."; exit 0; }
+            _step "Uninstalling: ${WHITE}$*${RESET}"
+            sudo pacman -Rns "$@" \
+                && { _ok "Uninstalled: $*"; _log "aur uninstall $*"; } \
+                || _die "Uninstall failed."
+            ;;
+
+        search)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg aur search <query>"
+            # Always use the formatted RPC search for consistent output
+            _aur_rpc_search "$1"
+            ;;
+
+        update|upgrade)
+            _step "Updating AUR packages…"
+            if [[ -n "$AUR_HELPER" ]]; then
+                _info "Using: $AUR_HELPER"
+                "$AUR_HELPER" -Sua "$@" \
+                    && { _ok "AUR packages updated."; _log "aur update"; } \
+                    || _die "AUR update failed."
+            else
+                _warn "No AUR helper detected. Cannot auto-update AUR packages."
+                _info "Install yay first:  vpkg aur install yay"
+            fi
+            ;;
+
+        info)
+            [[ $# -gt 0 ]] || _die "Usage: vpkg aur info <pkg>"
+            _step "Info — ${WHITE}$1${RESET}"
+            if [[ -n "$AUR_HELPER" ]]; then
+                "$AUR_HELPER" -Si "$1" 2>/dev/null \
+                    || _die "Package '$1' not found."
+            else
+                _require curl
+                curl -fsSL "https://aur.archlinux.org/rpc/?v=5&type=info&arg=$1" \
+                    | grep -oP '"[A-Za-z]*":"[^"]*"|"[A-Za-z]*":[0-9]+' \
+                    | sed \
+                        -e 's/"\([^"]*\)":"\([^"]*\)"/'"${BOLD}"'\1'"${RESET}"': \2/' \
+                        -e 's/"\([^"]*\)":\([0-9]*\)/'"${BOLD}"'\1'"${RESET}"': \2/'
+            fi
+            ;;
+
+        list)
+            _step "Installed AUR / foreign packages"
+            _sep
+            pacman -Qm
+            ;;
+
+        clean)
+            if [[ -n "$AUR_HELPER" ]]; then
+                _step "Cleaning AUR helper cache…"
+                "$AUR_HELPER" -Sc --noconfirm \
+                    && { _ok "AUR cache cleaned."; _log "aur clean"; }
+            else
+                _info "No AUR helper cache to clean."
+            fi
+            ;;
+
+        helper)
+            _step "AUR helper status"
+            if [[ -n "$AUR_HELPER" ]]; then
+                _ok "Found: $AUR_HELPER  ($(command -v "$AUR_HELPER"))"
+            else
+                _warn "No AUR helper installed."
+                _info "vpkg will use git + makepkg as a fallback."
+                _info "To install yay:  vpkg aur install yay"
+            fi
+            ;;
+
+        help)
+            echo -e "\n${BOLD}vpkg aur${RESET} — AUR backend\n"
+            printf "  ${WHITE}%-14s${RESET} %s\n" \
+                "install"    "Install from AUR (uses helper or makepkg)" \
+                "uninstall"  "Remove an AUR package" \
+                "search"     "Search AUR packages" \
+                "update"     "Update all AUR packages" \
+                "info"       "Show AUR package info" \
+                "list"       "List installed foreign/AUR packages" \
+                "clean"      "Clean AUR helper build cache" \
+                "helper"     "Show which AUR helper is detected"
+            echo ""
+            ;;
+
+        *)
+            _die "Unknown aur command: '$cmd'. Run 'vpkg aur help'."
+            ;;
+    esac
+}
+
+# =============================================================================
+#  GLOBAL COMMANDS
+# =============================================================================
+
+cmd_history() {
+    if [[ -f "$VPKG_LOG" ]]; then
+        _step "vpkg operation history  ${DIM}(${VPKG_LOG})${RESET}"
+        _sep
+        tail -n "${1:-40}" "$VPKG_LOG"
+    else
+        _info "No history yet. Log will appear at: $VPKG_LOG"
+    fi
+}
+
+cmd_version() {
+    echo -e "${BOLD}Vertex Pkg${RESET} v${VPKG_VERSION}"
+    echo -e "${DIM}Vertex Linux Package Manager${RESET}"
+    echo -e "Flatpak: $(flatpak --version 2>/dev/null | head -1 || echo 'not found')"
+    echo -e "Pacman:  $(pacman --version 2>/dev/null | head -1 || echo 'not found')"
+    local h; h=$(_detect_aur_helper)
+    echo -e "AUR:     ${h:-none detected (makepkg fallback active)}"
+}
+
+cmd_help() {
+    _banner
+    echo -e "${BOLD}USAGE${RESET}"
+    echo -e "  vpkg ${CYAN}<backend>${RESET} ${WHITE}<command>${RESET} [args…]\n"
+
+    echo -e "${BOLD}BACKENDS${RESET}"
+    echo -e "  ${CYAN}fp${RESET}   Flatpak  — sandboxed application packages"
+    echo -e "  ${CYAN}pm${RESET}   Pacman   — official Arch / Vertex repositories"
+    echo -e "  ${CYAN}aur${RESET}  AUR      — Arch User Repository"
+    echo ""
+
+    echo -e "${BOLD}COMMANDS (all backends)${RESET}"
+    _sep
+    printf "  ${WHITE}%-14s${RESET} %s\n" \
+        "install"    "Install one or more packages" \
+        "uninstall"  "Remove one or more packages (with deps)" \
+        "search"     "Search available packages" \
+        "update"     "Update packages (all if no args given)" \
+        "info"       "Show detailed info about a package" \
+        "list"       "List installed packages" \
+        "clean"      "Clean cache and orphans"
+    _sep
+    echo -e "${DIM}  Backend-specific extras — run 'vpkg <backend> help' for full list${RESET}"
+    _sep
+    printf "  ${WHITE}%-14s${RESET} %s\n" \
+        "history [n]" "Show last n vpkg operations (default 40)" \
+        "version"     "Print vpkg version and backend info" \
+        "help"        "Show this help screen"
+    echo ""
+
+    echo -e "${BOLD}EXAMPLES${RESET}"
+    printf "  %s\n" \
+        "vpkg fp  install  com.spotify.Client" \
+        "vpkg pm  install  neovim git base-devel" \
+        "vpkg aur install  yay" \
+        "vpkg pm  search   firefox" \
+        "vpkg aur update" \
+        "vpkg pm  owns     /usr/bin/pacman" \
+        "vpkg fp  clean" \
+        "vpkg history 20" \
+        "vpkg fp  help"
+    echo ""
+}
+
+# =============================================================================
+#  ENTRY POINT
+# =============================================================================
+
+main() {
+    local backend="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$backend" in
+        fp)
+            local subcmd="${1:-help}"; shift 2>/dev/null || true
+            cmd_fp "$subcmd" "$@"
+            ;;
+        pm)
+            local subcmd="${1:-help}"; shift 2>/dev/null || true
+            cmd_pm "$subcmd" "$@"
+            ;;
+        aur)
+            local subcmd="${1:-help}"; shift 2>/dev/null || true
+            cmd_aur "$subcmd" "$@"
+            ;;
+        history)
+            cmd_history "$@"
+            ;;
+        version|--version|-V)
+            cmd_version
+            ;;
+        help|--help|-h|"")
+            cmd_help
+            ;;
+        *)
+            _die "Unknown backend: '${backend}'. Valid: fp, pm, aur.  Run 'vpkg help'."
+            ;;
+    esac
+}
+
+main "$@"
