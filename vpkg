@@ -29,6 +29,9 @@ readonly VPKG_LOG="$VPKG_CACHE_DIR/vpkg.log"
 
 # Capture original args before any shifting — used for sudo re-exec
 VPKG_ORIG_ARGS=("$@")
+# Mark this process (and all children) as an internal vpkg call so that the
+# wrapper shims for pacman/flatpak/yay pass through to the real binaries.
+export _VPKG_INTERNAL=1
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
