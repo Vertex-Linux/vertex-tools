@@ -30,7 +30,7 @@ readonly VPKG_LOG="$VPKG_CACHE_DIR/vpkg.log"
 # Capture original args before any shifting — used for sudo re-exec
 VPKG_ORIG_ARGS=("$@")
 # Mark this process (and all children) as an internal vpkg call so that the
-# wrapper shims for pacman/flatpak/yay pass through to the real binaries.
+# wrapper shims for pacman/flatpak pass through to the real binaries.
 export _VPKG_INTERNAL=1
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -73,13 +73,6 @@ _no_root() {
 
 _require() {
     command -v "$1" &>/dev/null || _die "'$1' is not installed or not in PATH."
-}
-
-_detect_aur_helper() {
-    for h in yay paru aurman trizen; do
-        command -v "$h" &>/dev/null && { echo "$h"; return; }
-    done
-    echo ""
 }
 
 _banner() {
@@ -319,35 +312,35 @@ cmd_pm() {
 }
 
 # =============================================================================
-#  AUR — vpkg aur <command>
+#  AUR — vpkg aur <command>  (built-in git + makepkg, no external helper needed)
 # =============================================================================
 
 cmd_aur() {
     _no_root
-    local AUR_HELPER
-    AUR_HELPER=$(_detect_aur_helper)
     local cmd="$1"; shift
 
-    # Fallback: manual git + makepkg install
+    # Clone AUR package and build/install with makepkg.
+    # Extra args (e.g. --noconfirm) are forwarded to makepkg.
     _aur_makepkg_install() {
-        local pkg="$1"
+        local pkg="$1"; shift
+        local mkpkg_flags=("$@")
         _require git
         local tmpdir
         tmpdir=$(mktemp -d /tmp/vpkg-aur-XXXXXX)
         _info "Cloning AUR: https://aur.archlinux.org/${pkg}.git"
         git clone "https://aur.archlinux.org/${pkg}.git" "$tmpdir/$pkg" \
-            || _die "Failed to clone AUR package '$pkg'. Does it exist?"
+            || { rm -rf "$tmpdir"; _die "Failed to clone AUR package '$pkg'. Does it exist?"; }
         pushd "$tmpdir/$pkg" > /dev/null
         _info "Building with makepkg…"
-        makepkg -si --needed \
+        makepkg -si --needed "${mkpkg_flags[@]}" \
             && _ok "Installed AUR package: $pkg" \
-            || _die "makepkg build/install failed."
+            || { popd > /dev/null; rm -rf "$tmpdir"; _die "makepkg build/install failed for '$pkg'."; }
         popd > /dev/null
         rm -rf "$tmpdir"
         _log "aur install (makepkg) $pkg"
     }
 
-    # AUR RPC search — uses Python (installed on Vertex Linux) for clean output
+    # AUR RPC search — uses Python for clean formatted output
     _aur_rpc_search() {
         _require curl
         local query="$1"
@@ -356,15 +349,15 @@ cmd_aur() {
         local raw
         raw=$(curl -fsSL "https://aur.archlinux.org/rpc/v5/search/${query}?by=name-desc") \
             || _die "AUR RPC request failed. Check your connection."
-        echo "$raw" | python3 << 'PYEOF'
-import sys, json
+        VPKG_AUR_RAW="$raw" python3 << 'PYEOF'
+import os, json
 
 BOLD  = "\033[1m";  DIM    = "\033[2m";  RESET = "\033[0m"
 CYAN  = "\033[1;36m"; YELLOW = "\033[1;33m"; GREEN = "\033[1;32m"
 RED   = "\033[1;31m"; WHITE  = "\033[1;37m"; GRAY  = "\033[0;37m"
 
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(os.environ['VPKG_AUR_RAW'])
 except Exception as e:
     print(f"  Parse error: {e}", file=sys.stderr); sys.exit(1)
 
@@ -401,18 +394,15 @@ PYEOF
     case "$cmd" in
         install)
             [[ $# -gt 0 ]] || _die "Usage: vpkg aur install <pkg> [pkg…]"
-            _step "Installing from AUR: ${WHITE}$*${RESET}"
-            if [[ -n "$AUR_HELPER" ]]; then
-                _info "Using AUR helper: $AUR_HELPER"
-                "$AUR_HELPER" -S --needed "$@" \
-                    && { _ok "Installed: $*"; _log "aur install ($AUR_HELPER) $*"; } \
-                    || _die "AUR install failed."
-            else
-                _warn "No AUR helper found — falling back to git + makepkg."
-                for pkg in "$@"; do
-                    _aur_makepkg_install "$pkg"
-                done
-            fi
+            local pkgs=() flags=()
+            for arg in "$@"; do
+                [[ "$arg" == --* ]] && flags+=("$arg") || pkgs+=("$arg")
+            done
+            [[ ${#pkgs[@]} -gt 0 ]] || _die "No packages specified."
+            _step "Installing from AUR: ${WHITE}${pkgs[*]}${RESET}"
+            for pkg in "${pkgs[@]}"; do
+                _aur_makepkg_install "$pkg" "${flags[@]}"
+            done
             ;;
 
         uninstall|remove)
@@ -427,37 +417,94 @@ PYEOF
 
         search)
             [[ $# -gt 0 ]] || _die "Usage: vpkg aur search <query>"
-            # Always use the formatted RPC search for consistent output
             _aur_rpc_search "$1"
             ;;
 
         update|upgrade)
             _step "Updating AUR packages…"
-            if [[ -n "$AUR_HELPER" ]]; then
-                _info "Using: $AUR_HELPER"
-                "$AUR_HELPER" -Sua "$@" \
-                    && { _ok "AUR packages updated."; _log "aur update"; } \
-                    || _die "AUR update failed."
+            _require git curl
+            local flags=() pkglist=()
+            for arg in "$@"; do
+                [[ "$arg" == --* ]] && flags+=("$arg") || pkglist+=("$arg")
+            done
+            local installed_aur
+            if [[ ${#pkglist[@]} -gt 0 ]]; then
+                installed_aur=$(printf '%s\n' "${pkglist[@]}")
             else
-                _warn "No AUR helper detected. Cannot auto-update AUR packages."
-                _info "Install yay first:  vpkg aur install yay"
+                installed_aur=$(pacman -Qmq 2>/dev/null)
             fi
+            if [[ -z "$installed_aur" ]]; then
+                _info "No foreign/AUR packages installed."
+                _log "aur update: nothing to do"
+                return 0
+            fi
+            local updated=0 skipped=0 failed=0
+            while IFS= read -r pkg; do
+                [[ -z "$pkg" ]] && continue
+                local installed_ver aur_ver
+                installed_ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
+                aur_ver=$(curl -fsSL "https://aur.archlinux.org/rpc/v5/info?arg=${pkg}" 2>/dev/null \
+                    | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    r = d.get('results', [])
+    print(r[0].get('Version', '') if r else '')
+except:
+    print('')
+" 2>/dev/null)
+                if [[ -z "$aur_ver" ]]; then
+                    _warn "  $pkg: not found on AUR, skipping"
+                    (( skipped++ ))
+                    continue
+                fi
+                if [[ "$installed_ver" == "$aur_ver" ]]; then
+                    _info "  $pkg $installed_ver — up to date"
+                    (( skipped++ ))
+                    continue
+                fi
+                _info "  Updating $pkg: $installed_ver → $aur_ver"
+                if _aur_makepkg_install "$pkg" "${flags[@]}"; then
+                    (( updated++ ))
+                else
+                    (( failed++ ))
+                fi
+            done <<< "$installed_aur"
+            _ok "AUR update: $updated updated, $skipped up to date, $failed failed."
+            _log "aur update (makepkg): $updated updated, $failed failed"
             ;;
 
         info)
             [[ $# -gt 0 ]] || _die "Usage: vpkg aur info <pkg>"
             _step "Info — ${WHITE}$1${RESET}"
-            if [[ -n "$AUR_HELPER" ]]; then
-                "$AUR_HELPER" -Si "$1" 2>/dev/null \
-                    || _die "Package '$1' not found."
-            else
-                _require curl
-                curl -fsSL "https://aur.archlinux.org/rpc/?v=5&type=info&arg=$1" \
-                    | grep -oP '"[A-Za-z]*":"[^"]*"|"[A-Za-z]*":[0-9]+' \
-                    | sed \
-                        -e 's/"\([^"]*\)":"\([^"]*\)"/'"${BOLD}"'\1'"${RESET}"': \2/' \
-                        -e 's/"\([^"]*\)":\([0-9]*\)/'"${BOLD}"'\1'"${RESET}"': \2/'
-            fi
+            _require curl
+            local _info_raw
+            _info_raw=$(curl -fsSL "https://aur.archlinux.org/rpc/v5/info?arg=$1") \
+                || _die "AUR RPC request failed. Check your connection."
+            VPKG_AUR_RAW="$_info_raw" python3 << 'PYEOF'
+import os, json
+
+BOLD = "\033[1m"; RESET = "\033[0m"; RED = "\033[1;31m"
+
+try:
+    d = json.loads(os.environ['VPKG_AUR_RAW'])
+    r = d.get("results", [])
+    if not r:
+        print("  Package not found on AUR."); sys.exit(1)
+    pkg = r[0]
+    for field in ["Name", "Version", "Description", "URL", "License",
+                  "Maintainer", "NumVotes", "Popularity", "Keywords",
+                  "Depends", "MakeDepends"]:
+        v = pkg.get(field)
+        if v is not None:
+            if isinstance(v, list):
+                v = "  ".join(v)
+            print(f"  {BOLD}{field:<14}{RESET} {v}")
+    if pkg.get("OutOfDate"):
+        print(f"  {RED}[OUT OF DATE]{RESET}")
+except Exception as e:
+    print(f"  Error: {e}", file=sys.stderr); sys.exit(1)
+PYEOF
             ;;
 
         list)
@@ -467,37 +514,21 @@ PYEOF
             ;;
 
         clean)
-            if [[ -n "$AUR_HELPER" ]]; then
-                _step "Cleaning AUR helper cache…"
-                "$AUR_HELPER" -Sc --noconfirm \
-                    && { _ok "AUR cache cleaned."; _log "aur clean"; }
-            else
-                _info "No AUR helper cache to clean."
-            fi
-            ;;
-
-        helper)
-            _step "AUR helper status"
-            if [[ -n "$AUR_HELPER" ]]; then
-                _ok "Found: $AUR_HELPER  ($(command -v "$AUR_HELPER"))"
-            else
-                _warn "No AUR helper installed."
-                _info "vpkg will use git + makepkg as a fallback."
-                _info "To install yay:  vpkg aur install yay"
-            fi
+            _step "AUR build artifacts"
+            _info "Build directories in /tmp are cleaned up automatically after each install."
+            _log "aur clean"
             ;;
 
         help)
-            echo -e "\n${BOLD}vpkg aur${RESET} — AUR backend\n"
+            echo -e "\n${BOLD}vpkg aur${RESET} — AUR backend (built-in git + makepkg)\n"
             printf "  ${WHITE}%-14s${RESET} %s\n" \
-                "install"    "Install from AUR (uses helper or makepkg)" \
+                "install"    "Install from AUR (git clone + makepkg)" \
                 "uninstall"  "Remove an AUR package" \
                 "search"     "Search AUR packages" \
-                "update"     "Update all AUR packages" \
+                "update"     "Update all AUR packages (or specified ones)" \
                 "info"       "Show AUR package info" \
                 "list"       "List installed foreign/AUR packages" \
-                "clean"      "Clean AUR helper build cache" \
-                "helper"     "Show which AUR helper is detected"
+                "clean"      "Clean AUR build artifacts"
             echo ""
             ;;
 
@@ -526,8 +557,7 @@ cmd_version() {
     echo -e "${DIM}Vertex Linux Package Manager${RESET}"
     echo -e "Flatpak: $(flatpak --version 2>/dev/null | head -1 || echo 'not found')"
     echo -e "Pacman:  $(pacman --version 2>/dev/null | head -1 || echo 'not found')"
-    local h; h=$(_detect_aur_helper)
-    echo -e "AUR:     ${h:-none detected (makepkg fallback active)}"
+    echo -e "AUR:     built-in (git + makepkg)"
 }
 
 cmd_help() {
@@ -564,7 +594,7 @@ cmd_help() {
     printf "  %s\n" \
         "vpkg fp  install  com.spotify.Client" \
         "vpkg pm  install  neovim git base-devel" \
-        "vpkg aur install  yay" \
+        "vpkg aur install  google-chrome" \
         "vpkg pm  search   firefox" \
         "vpkg aur update" \
         "vpkg pm  owns     /usr/bin/pacman" \

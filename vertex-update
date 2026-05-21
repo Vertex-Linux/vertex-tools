@@ -101,17 +101,6 @@ def _read_version() -> str:
         return "unknown"
 
 
-def _vpkg_available() -> bool:
-    return Path("/usr/local/bin/vpkg").exists()
-
-
-def _detect_aur_helper() -> str | None:
-    for h in ("yay", "paru"):
-        if subprocess.run(["which", h], capture_output=True).returncode == 0:
-            return h
-    return None
-
-
 def _fetch_json(url: str, timeout: int = 15) -> dict:
     req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -317,7 +306,6 @@ class VertexUpdater(QMainWindow):
         self._latest_info: dict | None = None
         self._update_sha  = ""
         self._busy        = False
-        self._aur_helper  = _detect_aur_helper()
         self._worker      = None
         self._build_ui()
 
@@ -350,25 +338,13 @@ class VertexUpdater(QMainWindow):
         pkg_lay = QVBoxLayout(pkg_box)
         pkg_lay.setSpacing(8)
 
-        self.chk_pacman  = QCheckBox("System packages  (pacman -Syu)")
-        self.chk_flatpak = QCheckBox("Flatpak applications  (flatpak update)")
-
-        # AUR via vpkg if available, else direct helper
-        if _vpkg_available():
-            aur_label = "AUR packages  (via vpkg aur update)"
-        elif self._aur_helper:
-            aur_label = f"AUR packages  ({self._aur_helper})"
-        else:
-            aur_label = "AUR packages  (no helper found)"
-        self.chk_aur = QCheckBox(aur_label)
+        self.chk_pacman  = QCheckBox("System packages  (vpkg pm update)")
+        self.chk_flatpak = QCheckBox("Flatpak applications  (vpkg fp update)")
+        self.chk_aur     = QCheckBox("AUR packages  (vpkg aur — git + makepkg)")
 
         for chk in (self.chk_pacman, self.chk_aur, self.chk_flatpak):
             chk.setChecked(True)
             pkg_lay.addWidget(chk)
-
-        if not _vpkg_available() and not self._aur_helper:
-            self.chk_aur.setChecked(False)
-            self.chk_aur.setEnabled(False)
 
         self.btn_pkg = QPushButton("Update Packages")
         r = QHBoxLayout()
@@ -463,14 +439,11 @@ class VertexUpdater(QMainWindow):
             return
         cmds: list[list[str]] = []
         if self.chk_pacman.isChecked():
-            cmds.append(["pkexec", "pacman", "-Syu", "--noconfirm"])
+            cmds.append(["pkexec", "vpkg", "pm", "update", "--noconfirm"])
         if self.chk_aur.isChecked():
-            if _vpkg_available():
-                cmds.append(["/usr/local/bin/vpkg", "aur", "update", "--noconfirm"])
-            elif self._aur_helper:
-                cmds.append([self._aur_helper, "-Syu", "--noconfirm"])
+            cmds.append(["vpkg", "aur", "update"])
         if self.chk_flatpak.isChecked():
-            cmds.append(["pkexec", "flatpak", "update", "--noninteractive"])
+            cmds.append(["pkexec", "vpkg", "fp", "update"])
         if not cmds:
             self._log("Nothing selected.")
             return
