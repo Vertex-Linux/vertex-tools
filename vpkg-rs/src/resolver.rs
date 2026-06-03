@@ -1,4 +1,6 @@
-use crate::managers::{aur::AurManager, flatpak::FlatpakManager, pacman::PacmanManager, Manager};
+use crate::managers::{
+    aur::AurManager, flatpak::FlatpakManager, pacman::PacmanManager, vl::VlManager, Manager,
+};
 use crate::package::{Package, Source};
 use anyhow::Result;
 
@@ -6,6 +8,7 @@ pub struct Resolver {
     pub pacman: PacmanManager,
     pub aur: AurManager,
     pub flatpak: FlatpakManager,
+    pub vl: VlManager,
 }
 
 impl Resolver {
@@ -14,17 +17,19 @@ impl Resolver {
             pacman: PacmanManager::new(),
             aur: AurManager::new(),
             flatpak: FlatpakManager::new(),
+            vl: VlManager::new(),
         }
     }
 
     pub async fn search_all(&self, query: &str) -> Result<Vec<Package>> {
-        let (pm, aur, fp) = tokio::join!(
+        let (pm, aur, fp, vl) = tokio::join!(
             self.pacman.search(query),
             self.aur.search(query),
             self.flatpak.search(query),
+            self.vl.search(query),
         );
         let mut all = Vec::new();
-        for res in [pm, aur, fp] {
+        for res in [pm, aur, fp, vl] {
             if let Ok(mut v) = res {
                 all.append(&mut v);
             }
@@ -37,15 +42,18 @@ impl Resolver {
             Source::Pacman => self.pacman.search(query).await,
             Source::Aur => self.aur.search(query).await,
             Source::Flatpak => self.flatpak.search(query).await,
+            Source::VertexLinux => self.vl.search(query).await,
         }
     }
 
     /// Find which sources carry an exact package name.
+    /// VL uses a direct pkg.json lookup instead of a full search for efficiency.
     pub async fn find_sources(&self, name: &str) -> Vec<Source> {
-        let (pm, aur, fp) = tokio::join!(
+        let (pm, aur, fp, vl) = tokio::join!(
             self.pacman.search(name),
             self.aur.search(name),
             self.flatpak.search(name),
+            self.vl.fetch_pkg_json(name),
         );
         let mut sources = Vec::new();
         if pm.map(|v| v.iter().any(|p| p.name == name)).unwrap_or(false) {
@@ -55,13 +63,13 @@ impl Resolver {
             sources.push(Source::Aur);
         }
         if fp
-            .map(|v| {
-                v.iter()
-                    .any(|p| p.name == name || p.app_id.as_deref() == Some(name))
-            })
+            .map(|v| v.iter().any(|p| p.name == name || p.app_id.as_deref() == Some(name)))
             .unwrap_or(false)
         {
             sources.push(Source::Flatpak);
+        }
+        if vl.is_ok() {
+            sources.push(Source::VertexLinux);
         }
         sources
     }
@@ -72,7 +80,6 @@ impl Resolver {
             let sources = self.find_sources(name).await;
             let source = match sources.len() {
                 0 => {
-                    // Not found by exact search — try pacman first, then AUR
                     println!(
                         "\x1b[33m==> '{}' not found by exact name. Trying pacman…\x1b[0m",
                         name
@@ -99,13 +106,13 @@ impl Resolver {
                 Source::Pacman => self.pacman.install(&[name.clone()]).await?,
                 Source::Aur => self.aur.install(&[name.clone()]).await?,
                 Source::Flatpak => self.flatpak.install(&[name.clone()]).await?,
+                Source::VertexLinux => self.vl.install(&[name.clone()]).await?,
             }
         }
         Ok(())
     }
 
     pub async fn remove_auto(&self, packages: &[String]) -> Result<()> {
-        // Try pacman first (covers both pacman and AUR), then flatpak
         let pm_res = self.pacman.remove(packages).await;
         if pm_res.is_err() {
             self.flatpak.remove(packages).await?;
@@ -120,6 +127,8 @@ impl Resolver {
         self.aur.update().await?;
         println!("\x1b[35m══ Updating Flatpak packages ══\x1b[0m");
         self.flatpak.update().await?;
+        println!("\x1b[32m══ Vertex Linux repo packages ══\x1b[0m");
+        self.vl.update().await?;
         Ok(())
     }
 

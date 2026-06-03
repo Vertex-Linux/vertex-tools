@@ -77,7 +77,8 @@ impl App {
 
     pub fn cycle_filter(&mut self) {
         self.filter = match &self.filter {
-            None => Some(Source::Pacman),
+            None => Some(Source::VertexLinux),
+            Some(Source::VertexLinux) => Some(Source::Pacman),
             Some(Source::Pacman) => Some(Source::Aur),
             Some(Source::Aur) => Some(Source::Flatpak),
             Some(Source::Flatpak) => None,

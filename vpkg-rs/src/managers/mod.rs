@@ -1,6 +1,7 @@
 pub mod aur;
 pub mod flatpak;
 pub mod pacman;
+pub mod vl;
 
 use crate::package::Package;
 use anyhow::Result;

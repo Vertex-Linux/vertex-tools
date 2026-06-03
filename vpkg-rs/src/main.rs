@@ -18,6 +18,9 @@ async fn main() -> Result<()> {
     let resolver = Arc::new(Resolver::new());
 
     match cli.command {
+        Some(Commands::Vl { action }) => {
+            run_action(&resolver.vl, action, Some(Source::VertexLinux), &resolver).await?;
+        }
         Some(Commands::Aur { action }) => {
             run_action(&resolver.aur, action, Some(Source::Aur), &resolver).await?;
         }
@@ -112,6 +115,7 @@ async fn run_search_tui(
 
                 for (source_key, names) in &by_source {
                     let res = match source_key.as_str() {
+                        "vl" => resolver.vl.install(names).await,
                         "aur" => resolver.aur.install(names).await,
                         "pm" => resolver.pacman.install(names).await,
                         "fp" => resolver.flatpak.install(names).await,

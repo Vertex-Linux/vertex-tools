@@ -5,6 +5,7 @@ pub enum Source {
     Pacman,
     Aur,
     Flatpak,
+    VertexLinux,
 }
 
 impl Source {
@@ -13,6 +14,7 @@ impl Source {
             Source::Pacman => "PKG",
             Source::Aur => "AUR",
             Source::Flatpak => " FP",
+            Source::VertexLinux => " VL",
         }
     }
 
@@ -21,6 +23,7 @@ impl Source {
             Source::Pacman => Color::Rgb(6, 182, 212),
             Source::Aur => Color::Rgb(234, 179, 8),
             Source::Flatpak => Color::Rgb(139, 92, 246),
+            Source::VertexLinux => Color::Rgb(52, 211, 153),
         }
     }
 
@@ -29,6 +32,7 @@ impl Source {
             Source::Pacman => "pm",
             Source::Aur => "aur",
             Source::Flatpak => "fp",
+            Source::VertexLinux => "vl",
         }
     }
 }

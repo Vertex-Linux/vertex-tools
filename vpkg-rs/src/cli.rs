@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "vpkg2", about = "Vertex Package Manager — Flatpak · AUR · Pacman", version)]
+#[command(name = "vpkg", about = "Vertex Package Manager — VL · AUR · Pacman · Flatpak", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -9,6 +9,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Vertex Linux repo operations
+    Vl {
+        #[command(subcommand)]
+        action: Action,
+    },
     /// AUR package manager operations
     Aur {
         #[command(subcommand)]
