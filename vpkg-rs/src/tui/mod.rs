@@ -111,7 +111,7 @@ async fn event_loop(
 }
 
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
-    // Help overlay captures all keys
+    // ── Overlays always capture first ─────────────────────────────────────────
     if app.mode == Mode::Help {
         match code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -122,7 +122,6 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         return;
     }
 
-    // Source picker overlay captures all keys
     if let Mode::SourcePick(sources) = app.mode.clone() {
         match code {
             KeyCode::Esc => app.mode = Mode::Browse,
@@ -149,20 +148,68 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         return;
     }
 
-    match code {
-        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+    // Ctrl-C always quits regardless of mode
+    if let KeyCode::Char('c') = code {
+        if modifiers.contains(KeyModifiers::CONTROL) {
             app.should_quit = true;
+            return;
         }
-        KeyCode::Esc => {
-            if app.mode == Mode::Browse {
-                app.mode = Mode::Search;
-            } else if !app.search_input.is_empty() {
-                app.clear_search();
-            } else {
-                app.should_quit = true;
+    }
+
+    // ── Search mode: only structural keys act as hotkeys ─────────────────────
+    // Printable characters go straight into the input box; 'i', 'q', '?' etc.
+    // are just characters here.
+    if app.mode == Mode::Search {
+        match code {
+            KeyCode::Esc => {
+                if !app.search_input.is_empty() {
+                    app.clear_search();
+                } else {
+                    app.should_quit = true;
+                }
             }
+            KeyCode::Backspace => {
+                app.search_input.pop();
+                app.last_input = Instant::now();
+                if app.search_input.is_empty() {
+                    app.search_results.clear();
+                    app.marked.clear();
+                    app.selected = 0;
+                    app.status =
+                        String::from(" Type to search · Tab: filter · ? help · q quit");
+                }
+            }
+            KeyCode::Tab => {
+                app.cycle_filter();
+            }
+            KeyCode::Up => {
+                app.mode = Mode::Browse;
+                app.move_up();
+            }
+            KeyCode::Down => {
+                app.mode = Mode::Browse;
+                app.move_down();
+            }
+            KeyCode::Enter => {
+                // Enter from search bar: move focus to results and install selection
+                app.mode = Mode::Browse;
+                app.resolve_install();
+            }
+            KeyCode::Char(c) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+                app.search_input.push(c);
+                app.last_input = Instant::now();
+            }
+            _ => {}
         }
-        KeyCode::Char('q') if app.mode == Mode::Browse && modifiers.is_empty() => {
+        return;
+    }
+
+    // ── Browse mode: full hotkey set ──────────────────────────────────────────
+    match code {
+        KeyCode::Esc => {
+            app.mode = Mode::Search;
+        }
+        KeyCode::Char('q') if modifiers.is_empty() => {
             app.should_quit = true;
         }
         KeyCode::Char('?') => {
@@ -172,22 +219,22 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.cycle_filter();
         }
         KeyCode::Up => {
-            app.mode = Mode::Browse;
             app.move_up();
         }
         KeyCode::Down => {
-            app.mode = Mode::Browse;
             app.move_down();
         }
-        KeyCode::Char(' ') if app.mode == Mode::Browse => {
+        KeyCode::Char(' ') => {
             app.toggle_mark();
         }
         KeyCode::Char('i') | KeyCode::Enter => {
             app.resolve_install();
         }
         KeyCode::Backspace => {
+            // Backspace while browsing: jump back to search and delete a char
             app.search_input.pop();
             app.last_input = Instant::now();
+            app.mode = Mode::Search;
             if app.search_input.is_empty() {
                 app.search_results.clear();
                 app.marked.clear();
@@ -195,9 +242,9 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 app.status =
                     String::from(" Type to search · Tab: filter · ? help · q quit");
             }
-            app.mode = Mode::Search;
         }
         KeyCode::Char(c) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            // Typing while browsing: jump back to search mode and append
             app.search_input.push(c);
             app.last_input = Instant::now();
             app.mode = Mode::Search;
