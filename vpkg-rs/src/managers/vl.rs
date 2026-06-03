@@ -27,6 +27,15 @@ pub struct PkgJson {
     #[serde(rename = "type")]
     pub install_type: InstallType,
     pub file: String,
+    /// Pacman dependencies installed before this package
+    #[serde(default)]
+    pub pm: Vec<String>,
+    /// AUR dependencies installed before this package
+    #[serde(default)]
+    pub aur: Vec<String>,
+    /// Flatpak dependencies installed before this package
+    #[serde(default)]
+    pub fp: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]

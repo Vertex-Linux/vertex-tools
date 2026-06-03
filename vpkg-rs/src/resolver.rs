@@ -74,6 +74,41 @@ impl Resolver {
         sources
     }
 
+    /// Install VL packages, resolving pm/aur/fp dependencies first.
+    pub async fn install_vl_packages(&self, packages: &[String]) -> Result<()> {
+        for name in packages {
+            let meta = self.vl.fetch_pkg_json(name).await?;
+
+            if !meta.pm.is_empty() {
+                println!(
+                    "\x1b[36m==> Installing pacman deps for {}: {}\x1b[0m",
+                    name,
+                    meta.pm.join("  ")
+                );
+                self.pacman.install(&meta.pm).await?;
+            }
+            if !meta.aur.is_empty() {
+                println!(
+                    "\x1b[33m==> Installing AUR deps for {}: {}\x1b[0m",
+                    name,
+                    meta.aur.join("  ")
+                );
+                self.aur.install(&meta.aur).await?;
+            }
+            if !meta.fp.is_empty() {
+                println!(
+                    "\x1b[35m==> Installing Flatpak deps for {}: {}\x1b[0m",
+                    name,
+                    meta.fp.join("  ")
+                );
+                self.flatpak.install(&meta.fp).await?;
+            }
+
+            self.vl.install(&[name.clone()]).await?;
+        }
+        Ok(())
+    }
+
     /// Auto-install: detect sources, prompt if ambiguous.
     pub async fn install_auto(&self, packages: &[String]) -> Result<()> {
         for name in packages {
@@ -106,7 +141,7 @@ impl Resolver {
                 Source::Pacman => self.pacman.install(&[name.clone()]).await?,
                 Source::Aur => self.aur.install(&[name.clone()]).await?,
                 Source::Flatpak => self.flatpak.install(&[name.clone()]).await?,
-                Source::VertexLinux => self.vl.install(&[name.clone()]).await?,
+                Source::VertexLinux => self.install_vl_packages(&[name.clone()]).await?,
             }
         }
         Ok(())
