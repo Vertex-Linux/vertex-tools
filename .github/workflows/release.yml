@@ -1,0 +1,136 @@
+name: Release vpkg
+
+on:
+  push:
+    tags:
+      - "vpkg-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. vpkg-v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            binary: vpkg
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            binary: vpkg
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vpkg-rs/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('vpkg-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Install cross-compile deps
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        working-directory: vpkg-rs
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: |
+          strip vpkg-rs/target/${{ matrix.target }}/release/${{ matrix.binary }} 2>/dev/null || true
+
+      - name: Rename binary for upload
+        run: |
+          cp vpkg-rs/target/${{ matrix.target }}/release/${{ matrix.binary }} \
+             ${{ matrix.binary }}-${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}-${{ matrix.target }}
+          path: ${{ matrix.binary }}-${{ matrix.target }}
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Resolve tag and version
+        id: version
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#vpkg-}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: vpkg ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## vpkg ${{ steps.version.outputs.version }}
+
+            Vertex Package Manager — unified Pacman · AUR · Flatpak frontend.
+
+            ### Install
+
+            ```bash
+            # x86_64
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/vpkg-x86_64-unknown-linux-gnu \
+              -o vpkg && chmod +x vpkg && sudo mv vpkg /usr/local/bin/
+
+            # aarch64
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/vpkg-aarch64-unknown-linux-gnu \
+              -o vpkg && chmod +x vpkg && sudo mv vpkg /usr/local/bin/
+            ```
+
+            ### Usage
+
+            ```
+            vpkg                    # interactive TUI search
+            vpkg install <pkg>      # auto-detect source
+            vpkg aur install <pkg>  # force AUR
+            vpkg pm  install <pkg>  # force pacman
+            vpkg fp  install <pkg>  # force flatpak
+            vpkg update             # update all managers
+            vpkg list               # list all installed
+            ```
+          files: |
+            artifacts/vpkg-x86_64-unknown-linux-gnu
+            artifacts/vpkg-aarch64-unknown-linux-gnu

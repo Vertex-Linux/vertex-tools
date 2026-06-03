@@ -4,6 +4,7 @@
 import sys
 import json
 import os
+import platform
 import subprocess
 import tempfile
 import urllib.request
@@ -28,6 +29,7 @@ TOOLS_REPO      = "Vertex-Linux/vertex-tools"
 TOOLS_RAW       = f"https://raw.githubusercontent.com/{TOOLS_REPO}/main"
 DRIVERS_REPO    = "Vertex-Linux/vertex-graphics-installer"
 DRIVERS_API     = f"https://api.github.com/repos/{DRIVERS_REPO}/releases/latest"
+VPKG_API        = "https://api.github.com/repos/Vertex-Linux/vertex-tools/releases/latest"
 
 HEADERS = {"User-Agent": "VertexUpdater/1.1"}
 
@@ -229,16 +231,30 @@ class ToolFetcher(QThread):
                 self._emit(f"  [error] vertex-drivers: {e}")
                 errors += 1
 
-        # ── vpkg from vertex-tools main branch ───────────────────────────────
+        # ── vpkg from latest GitHub release ──────────────────────────────────
         if self.do_vpkg:
-            self._emit("Fetching latest vpkg…")
+            self._emit("Fetching latest vpkg release…")
             try:
-                content = _fetch_bytes(f"{TOOLS_RAW}/vpkg")
-                fd, tmp = tempfile.mkstemp(prefix="vertex-vpkg-")
-                os.write(fd, content)
-                os.close(fd)
-                tmpfiles.append((tmp, "/usr/local/bin/vpkg"))
-                self._emit(f"  vpkg ready  ({len(content)} bytes)")
+                data = _fetch_json(VPKG_API)
+                tag  = data["tag_name"]
+                arch = platform.machine()   # x86_64 or aarch64
+                asset_name = f"vpkg-{arch}-unknown-linux-gnu"
+                asset_url = next(
+                    (a["browser_download_url"] for a in data.get("assets", [])
+                     if a["name"] == asset_name),
+                    None,
+                )
+                if not asset_url:
+                    self._emit(f"  [error] No '{asset_name}' asset found in release {tag}")
+                    errors += 1
+                else:
+                    self._emit(f"  Downloading vpkg {tag} ({asset_name})…")
+                    content = _fetch_bytes(asset_url)
+                    fd, tmp = tempfile.mkstemp(prefix="vertex-vpkg-")
+                    os.write(fd, content)
+                    os.close(fd)
+                    tmpfiles.append((tmp, "/usr/local/bin/vpkg"))
+                    self._emit(f"  vpkg {tag} ready  ({len(content) // 1024} KB)")
             except Exception as e:
                 self._emit(f"  [error] vpkg: {e}")
                 errors += 1
@@ -363,7 +379,7 @@ class VertexUpdater(QMainWindow):
             "Vertex Driver Manager  (arc360alt/vertex-graphics-installer — latest release)"
         )
         self.chk_vpkg = QCheckBox(
-            "vpkg package manager  (arc360alt/vertex-tools)"
+            "vpkg package manager  (arc360alt/vertex-tools — latest release)"
         )
         self.chk_self = QCheckBox(
             "Vertex Updater itself  (arc360alt/vertex-tools)"

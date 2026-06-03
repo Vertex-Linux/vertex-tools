@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRICATED: This script is no longer maintained. It may still work, but use at your own risk.
 # =============================================================================
 #  vpkg — Vertex Pkg | Package Manager for Vertex Linux
 #  Manages Flatpak, Pacman, and AUR packages with a unified CLI.
@@ -22,7 +23,7 @@
 #    version              Print vpkg version
 #    help                 Show this help
 # =============================================================================
-
+# DO NOT USE THIS SCRIPT
 readonly VPKG_VERSION="1.1.0"
 readonly VPKG_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/vpkg"
 readonly VPKG_LOG="$VPKG_CACHE_DIR/vpkg.log"
@@ -78,6 +79,7 @@ _require() {
 _banner() {
     echo -e "${CYAN}${BOLD}"
     cat << 'EOF'
+    DEPRICATED, PLEASE UPDATE
   ██╗   ██╗██████╗ ██╗  ██╗ ██████╗
   ██║   ██║██╔══██╗██║ ██╔╝██╔════╝
   ██║   ██║██████╔╝█████╔╝ ██║  ███╗
