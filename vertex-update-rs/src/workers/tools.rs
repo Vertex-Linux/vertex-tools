@@ -1,4 +1,4 @@
-use crate::constants::{DRIVERS_API, SELF_RELEASES_API, VPKG_API};
+use crate::constants::{DRIVERS_API, SELF_RELEASES_API, VPKG_RELEASES_API};
 use crate::net::{fetch_bytes, fetch_json};
 use crate::workers::Msg;
 use eframe::egui;
@@ -53,8 +53,7 @@ pub fn run(
                     files.push((src, dst));
                 }
                 Ok(None) => {
-                    log!("  [error] vpkg asset not found for this architecture");
-                    errors += 1;
+                    log!("  vpkg: no release published yet — skipping");
                 }
                 Err(e) => {
                     log!("  [error] vpkg: {e}");
@@ -146,68 +145,54 @@ pub fn run(
 
         // ── Calla Desktop ─────────────────────────────────────────────────────
         if do_calla {
-            log!("\nSyncing package database before Calla install…");
-            // Refresh pacman's db first — otherwise pacman can't find packages
-            // and makepkg -si will fail with "database file not found" errors.
-            let sync = Command::new("pkexec")
-                .args(["pacman", "-Sy", "--noconfirm"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
+            log!("\nUpdating Calla Desktop…");
 
-            if let Ok(mut child) = sync {
-                let stdout = child.stdout.take().unwrap();
-                let stderr = child.stderr.take().unwrap();
-                let tx2 = tx.clone(); let ctx2 = ctx.clone();
-                let h = std::thread::spawn(move || {
-                    for l in BufReader::new(stderr).lines().flatten() {
-                        let _ = tx2.send(Msg::Log(l)); ctx2.request_repaint();
-                    }
-                });
-                for l in BufReader::new(stdout).lines().flatten() {
-                    let _ = tx.send(Msg::Log(l)); ctx.request_repaint();
-                }
-                h.join().ok();
-                child.wait().ok();
-            }
+            // Clean any previous build dir
+            let _ = std::fs::remove_dir_all("/tmp/calla-upd");
 
-            log!("Installing / updating Calla Desktop…");
-            match Command::new("vpkg")
-                .args(["vl", "install", "calla", "--no-deps"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                Err(e) => {
-                    log!("  [error] Could not run vpkg: {e}");
+            // 1. git clone
+            log!("  Cloning Vertex-Linux/Calla…");
+            let ok = run_streaming(
+                "git",
+                &["clone", "https://github.com/Vertex-Linux/Calla.git", "/tmp/calla-upd/"],
+                None,
+                &tx, &ctx,
+            );
+            if !ok {
+                log!("  [error] git clone failed");
+                errors += 1;
+            } else {
+                // 2. pkexec makepkg -sl  (build + sync deps, no install step)
+                log!("  Building package…");
+                let ok = run_streaming(
+                    "makepkg",
+                    &["-s"],
+                    Some("/tmp/calla-upd"),
+                    &tx, &ctx,
+                );
+                if !ok {
+                    log!("  [error] makepkg failed");
                     errors += 1;
-                }
-                Ok(mut child) => {
-                    let stdout = child.stdout.take().unwrap();
-                    let stderr = child.stderr.take().unwrap();
-                    let tx2 = tx.clone();
-                    let ctx2 = ctx.clone();
-                    let h = std::thread::spawn(move || {
-                        for line in BufReader::new(stderr).lines().flatten() {
-                            let _ = tx2.send(Msg::Log(line));
-                            ctx2.request_repaint();
-                        }
-                    });
-                    for line in BufReader::new(stdout).lines().flatten() {
-                        let _ = tx.send(Msg::Log(line));
-                        ctx.request_repaint();
-                    }
-                    h.join().ok();
-                    match child.wait() {
-                        Ok(s) if !s.success() => {
-                            log!("  [error] Calla update exited with code {}", s.code().unwrap_or(-1));
-                            errors += 1;
-                        }
+                } else {
+                    // 3. find the built .pkg.tar.zst and install it
+                    match find_built_pkg("/tmp/calla-upd") {
                         Err(e) => {
                             log!("  [error] {e}");
                             errors += 1;
                         }
-                        _ => {}
+                        Ok(pkg) => {
+                            log!("  Installing {}…", pkg);
+                            let ok = run_streaming(
+                                "pkexec",
+                                &["pacman", "-U", "--noconfirm", &pkg],
+                                Some("/tmp/calla-upd"),
+                                &tx, &ctx,
+                            );
+                            if !ok {
+                                log!("  [error] pacman -U failed");
+                                errors += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -219,6 +204,58 @@ pub fn run(
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Run a command, stream stdout+stderr to the log, return true if it succeeded.
+fn run_streaming(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+    tx: &Sender<Msg>,
+    ctx: &egui::Context,
+) -> bool {
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    match cmd.spawn() {
+        Err(e) => {
+            let _ = tx.send(Msg::Log(format!("[error starting '{}': {}]", program, e)));
+            ctx.request_repaint();
+            false
+        }
+        Ok(mut child) => {
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let tx2 = tx.clone();
+            let ctx2 = ctx.clone();
+            let h = std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().flatten() {
+                    let _ = tx2.send(Msg::Log(line));
+                    ctx2.request_repaint();
+                }
+            });
+            for line in BufReader::new(stdout).lines().flatten() {
+                let _ = tx.send(Msg::Log(line));
+                ctx.request_repaint();
+            }
+            h.join().ok();
+            matches!(child.wait(), Ok(s) if s.success())
+        }
+    }
+}
+
+/// Find the first .pkg.tar.zst / .pkg.tar.xz in a directory.
+fn find_built_pkg(dir: &str) -> anyhow::Result<String> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz") {
+            return Ok(path.to_string_lossy().to_string());
+        }
+    }
+    anyhow::bail!("No .pkg.tar.zst found in {}", dir)
+}
 
 fn write_tmp(prefix: &str, bytes: &[u8]) -> anyhow::Result<String> {
     let ts = std::time::SystemTime::now()
@@ -254,12 +291,31 @@ fn fetch_drivers() -> anyhow::Result<Option<(String, String, String, usize)>> {
 }
 
 fn fetch_vpkg() -> anyhow::Result<Option<(String, String, String, usize)>> {
-    let data = fetch_json(VPKG_API)?;
-    let tag = data["tag_name"].as_str().unwrap_or("?").to_string();
+    let releases = fetch_json(VPKG_RELEASES_API)?;
     let arch = std::env::consts::ARCH; // "x86_64" or "aarch64"
     let asset_name = format!("vpkg-{arch}-unknown-linux-gnu");
 
-    let url = data["assets"]
+    // Find the most recent release whose tag starts with "vpkg-".
+    // Using /releases/latest would pick up -vu releases which have no vpkg assets.
+    let release = releases
+        .as_array()
+        .and_then(|arr| {
+            arr.iter().find(|r| {
+                r["tag_name"]
+                    .as_str()
+                    .map(|t| t.starts_with("vpkg-"))
+                    .unwrap_or(false)
+            })
+        })
+        .cloned();
+
+    let release = match release {
+        Some(r) => r,
+        None => return Ok(None), // no vpkg release published yet — caller logs informational
+    };
+
+    let tag = release["tag_name"].as_str().unwrap_or("?").to_string();
+    let url = release["assets"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
@@ -269,7 +325,8 @@ fn fetch_vpkg() -> anyhow::Result<Option<(String, String, String, usize)>> {
         .map(str::to_string);
 
     match url {
-        None => Ok(None),
+        // Release exists but no matching asset — surface as an error so the user notices
+        None => anyhow::bail!("release {tag} has no asset '{asset_name}'"),
         Some(url) => {
             let bytes = fetch_bytes(&url)?;
             let kb = bytes.len() / 1024;

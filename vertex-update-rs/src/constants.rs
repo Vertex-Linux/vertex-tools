@@ -6,12 +6,13 @@ pub const OS_UPDATE_URL: &str =
 pub const DRIVERS_API: &str =
     "https://api.github.com/repos/Vertex-Linux/vertex-graphics-installer/releases/latest";
 
-pub const VPKG_API: &str =
-    "https://api.github.com/repos/arc360alt/vertex-tools/releases/latest";
+// All releases — scanned for a tag starting with "vpkg-"
+pub const VPKG_RELEASES_API: &str =
+    "https://api.github.com/repos/Vertex-Linux/vertex-tools/releases";
 
 // Scanned for the first release whose tag ends with "-vu"
 pub const SELF_RELEASES_API: &str =
-    "https://api.github.com/repos/arc360alt/vertex-tools/releases";
+    "https://api.github.com/repos/Vertex-Linux/vertex-tools/releases";
 
 pub const VERSION_FILE: &str = "/etc/vertex-release";
 pub const USER_AGENT: &str = "VertexUpdater/2.0";
