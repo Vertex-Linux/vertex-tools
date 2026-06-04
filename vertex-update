@@ -193,11 +193,12 @@ class ToolFetcher(QThread):
     finished = pyqtSignal(int)   # 0 = success
     self_updated = pyqtSignal()  # emitted when vertex-update itself was replaced
 
-    def __init__(self, do_drivers: bool, do_vpkg: bool, do_self: bool):
+    def __init__(self, do_drivers: bool, do_vpkg: bool, do_self: bool, do_calla: bool):
         super().__init__()
         self.do_drivers = do_drivers
         self.do_vpkg    = do_vpkg
         self.do_self    = do_self
+        self.do_calla   = do_calla
 
     def _emit(self, msg: str):
         self.line.emit(msg)
@@ -332,6 +333,24 @@ class ToolFetcher(QThread):
             self._emit(f"\n[install exited with code {proc.returncode}]")
             errors += 1
 
+        # ── Calla Desktop ─────────────────────────────────────────────────────
+        if self.do_calla:
+            self._emit("\nUpdating Calla Desktop…")
+            try:
+                proc = subprocess.Popen(
+                    ["vpkg", "vl", "install", "calla", "--no-deps"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                )
+                for ln in proc.stdout:
+                    self._emit(ln.rstrip())
+                proc.wait()
+                if proc.returncode != 0:
+                    self._emit(f"  [error] Calla update exited with code {proc.returncode}")
+                    errors += 1
+            except Exception as e:
+                self._emit(f"  [error] Calla: {e}")
+                errors += 1
+
         self.finished.emit(0 if errors == 0 else 1)
 
 
@@ -407,7 +426,10 @@ class VertexUpdater(QMainWindow):
         self.chk_self = QCheckBox(
             "Vertex Updater itself  (arc360alt/vertex-tools)"
         )
-        for chk in (self.chk_drivers, self.chk_vpkg, self.chk_self):
+        self.chk_calla = QCheckBox(
+            "Calla Desktop  (vpkg vl install calla --no-deps)"
+        )
+        for chk in (self.chk_drivers, self.chk_vpkg, self.chk_self, self.chk_calla):
             chk.setChecked(True)
             tool_lay.addWidget(chk)
 
@@ -508,13 +530,14 @@ class VertexUpdater(QMainWindow):
         do_drivers = self.chk_drivers.isChecked()
         do_vpkg    = self.chk_vpkg.isChecked()
         do_self    = self.chk_self.isChecked()
-        if not any([do_drivers, do_vpkg, do_self]):
+        do_calla   = self.chk_calla.isChecked()
+        if not any([do_drivers, do_vpkg, do_self, do_calla]):
             self._log("No tools selected.")
             return
         self._set_busy(True)
         self._status("Downloading tool updates…")
         self._log("=== Vertex Tool Updates ===")
-        self._worker = ToolFetcher(do_drivers, do_vpkg, do_self)
+        self._worker = ToolFetcher(do_drivers, do_vpkg, do_self, do_calla)
         self._worker.line.connect(self._log)
         self._worker.finished.connect(self._on_tools_done)
         self._worker.self_updated.connect(self._on_self_updated)

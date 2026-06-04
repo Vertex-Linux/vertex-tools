@@ -75,51 +75,47 @@ impl Resolver {
     }
 
     /// Install VL packages, resolving pm/aur/fp dependencies first.
-    pub async fn install_vl_packages(&self, packages: &[String]) -> Result<()> {
+    /// Pass `no_deps = true` to skip the dependency prompt entirely.
+    pub async fn install_vl_packages(&self, packages: &[String], no_deps: bool) -> Result<()> {
         for name in packages {
             let meta = self.vl.fetch_pkg_json(name).await?;
 
             let has_deps = !meta.pm.is_empty() || !meta.aur.is_empty() || !meta.fp.is_empty();
 
             if has_deps {
-                println!("\x1b[32m==> Dependencies for {}:\x1b[0m", name);
-                if !meta.pm.is_empty() {
-                    println!(
-                        "    \x1b[36m[PKG]\x1b[0m  {}",
-                        meta.pm.join("  ")
-                    );
-                }
-                if !meta.aur.is_empty() {
-                    println!(
-                        "    \x1b[33m[AUR]\x1b[0m  {}",
-                        meta.aur.join("  ")
-                    );
-                }
-                if !meta.fp.is_empty() {
-                    println!(
-                        "    \x1b[35m[ FP]\x1b[0m  {}",
-                        meta.fp.join("  ")
-                    );
-                }
-
-                print!("\n\x1b[32m==> Install dependencies? [Y/n] \x1b[0m");
-                use std::io::Write;
-                std::io::stdout().flush()?;
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-
-                if !line.trim().eq_ignore_ascii_case("n") {
+                if no_deps {
+                    println!("\x1b[33m==> Skipping dependencies for {} (--no-deps).\x1b[0m", name);
+                } else {
+                    println!("\x1b[32m==> Dependencies for {}:\x1b[0m", name);
                     if !meta.pm.is_empty() {
-                        self.pacman.install(&meta.pm).await?;
+                        println!("    \x1b[36m[PKG]\x1b[0m  {}", meta.pm.join("  "));
                     }
                     if !meta.aur.is_empty() {
-                        self.aur.install(&meta.aur).await?;
+                        println!("    \x1b[33m[AUR]\x1b[0m  {}", meta.aur.join("  "));
                     }
                     if !meta.fp.is_empty() {
-                        self.flatpak.install(&meta.fp).await?;
+                        println!("    \x1b[35m[ FP]\x1b[0m  {}", meta.fp.join("  "));
                     }
-                } else {
-                    println!("\x1b[33m==> Skipping dependencies.\x1b[0m");
+
+                    print!("\n\x1b[32m==> Install dependencies? [Y/n] \x1b[0m");
+                    use std::io::Write;
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+
+                    if line.trim().eq_ignore_ascii_case("n") {
+                        println!("\x1b[33m==> Skipping dependencies.\x1b[0m");
+                    } else {
+                        if !meta.pm.is_empty() {
+                            self.pacman.install(&meta.pm).await?;
+                        }
+                        if !meta.aur.is_empty() {
+                            self.aur.install(&meta.aur).await?;
+                        }
+                        if !meta.fp.is_empty() {
+                            self.flatpak.install(&meta.fp).await?;
+                        }
+                    }
                 }
             }
 
@@ -160,7 +156,7 @@ impl Resolver {
                 Source::Pacman => self.pacman.install(&[name.clone()]).await?,
                 Source::Aur => self.aur.install(&[name.clone()]).await?,
                 Source::Flatpak => self.flatpak.install(&[name.clone()]).await?,
-                Source::VertexLinux => self.install_vl_packages(&[name.clone()]).await?,
+                Source::VertexLinux => self.install_vl_packages(&[name.clone()], false).await?,
             }
         }
         Ok(())

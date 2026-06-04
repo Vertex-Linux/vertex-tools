@@ -14,6 +14,7 @@ pub fn run(
     do_drivers: bool,
     do_vpkg: bool,
     do_self: bool,
+    do_calla: bool,
 ) {
     std::thread::spawn(move || {
         macro_rules! log {
@@ -137,6 +138,50 @@ pub fn run(
                 status.code().unwrap_or(-1)
             );
             errors += 1;
+        }
+
+        // ── Calla Desktop ─────────────────────────────────────────────────────
+        if do_calla {
+            log!("\nUpdating Calla Desktop…");
+            match Command::new("vpkg")
+                .args(["vl", "install", "calla", "--no-deps"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Err(e) => {
+                    log!("  [error] Could not run vpkg: {e}");
+                    errors += 1;
+                }
+                Ok(mut child) => {
+                    let stdout = child.stdout.take().unwrap();
+                    let stderr = child.stderr.take().unwrap();
+                    let tx2 = tx.clone();
+                    let ctx2 = ctx.clone();
+                    let h = std::thread::spawn(move || {
+                        for line in BufReader::new(stderr).lines().flatten() {
+                            let _ = tx2.send(Msg::Log(line));
+                            ctx2.request_repaint();
+                        }
+                    });
+                    for line in BufReader::new(stdout).lines().flatten() {
+                        let _ = tx.send(Msg::Log(line));
+                        ctx.request_repaint();
+                    }
+                    h.join().ok();
+                    match child.wait() {
+                        Ok(s) if !s.success() => {
+                            log!("  [error] Calla update exited with code {}", s.code().unwrap_or(-1));
+                            errors += 1;
+                        }
+                        Err(e) => {
+                            log!("  [error] {e}");
+                            errors += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
         let _ = tx.send(Msg::Done(errors == 0));

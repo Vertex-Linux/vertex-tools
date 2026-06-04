@@ -19,8 +19,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Vl { action }) => match action {
-            Action::Install { packages } => {
-                resolver.install_vl_packages(&packages).await?;
+            Action::Install { packages, no_deps } => {
+                resolver.install_vl_packages(&packages, no_deps).await?;
             }
             Action::Remove { packages } => {
                 resolver.vl.remove(&packages).await?;
@@ -77,7 +77,7 @@ async fn run_action<M: Manager>(
     resolver: &Arc<Resolver>,
 ) -> Result<()> {
     match action {
-        Action::Install { packages } => {
+        Action::Install { packages, .. } => {
             manager.install(&packages).await?;
         }
         Action::Remove { packages } => {
@@ -131,7 +131,7 @@ async fn run_search_tui(
 
                 for (source_key, names) in &by_source {
                     let res = match source_key.as_str() {
-                        "vl" => resolver.install_vl_packages(names).await,
+                        "vl" => resolver.install_vl_packages(names, false).await,
                         "aur" => resolver.aur.install(names).await,
                         "pm" => resolver.pacman.install(names).await,
                         "fp" => resolver.flatpak.install(names).await,

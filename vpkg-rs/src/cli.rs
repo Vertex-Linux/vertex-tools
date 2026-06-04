@@ -50,7 +50,12 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum Action {
     /// Install packages
-    Install { packages: Vec<String> },
+    Install {
+        packages: Vec<String>,
+        /// Skip dependency installation without prompting
+        #[arg(long)]
+        no_deps: bool,
+    },
     /// Remove packages
     Remove { packages: Vec<String> },
     /// Update all packages from this source
