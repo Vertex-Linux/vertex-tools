@@ -283,13 +283,13 @@ impl VlManager {
     async fn run_install(&self, meta: &PkgJson, dest: &PathBuf, tmp_path: &PathBuf) -> Result<()> {
         match meta.install_type {
             InstallType::Pacman => {
-                println!("\x1b[32m==> Installing via pacman -U…\x1b[0m");
-                let status = Command::new("sudo")
+                println!("\x1b[32m==> Installing via pkexec pacman -U…\x1b[0m");
+                let status = Command::new("pkexec")
                     .args(["pacman", "-U", "--noconfirm"])
                     .arg(dest)
                     .status()
                     .await
-                    .context("pacman not found")?;
+                    .context("pkexec not found")?;
                 if !status.success() {
                     anyhow::bail!("pacman -U failed for '{}'", meta.name);
                 }
@@ -310,11 +310,11 @@ impl VlManager {
                 let bin_name = meta.rename_file.as_deref().unwrap_or(&meta.name);
                 let dest_bin = format!("/usr/local/bin/{}", bin_name);
                 println!("\x1b[32m==> Installing binary → {}…\x1b[0m", dest_bin);
-                let status = Command::new("sudo")
+                let status = Command::new("pkexec")
                     .args(["install", "-m", "755", dest.to_str().unwrap_or(""), &dest_bin])
                     .status()
                     .await
-                    .context("sudo not found")?;
+                    .context("pkexec not found")?;
                 if !status.success() {
                     anyhow::bail!("Failed to install binary to {}", dest_bin);
                 }
@@ -370,7 +370,7 @@ impl VlManager {
                 }
                 let dest_bin = format!("/usr/local/bin/{}", bin_name);
                 println!("\x1b[32m==> Installing binary → {}…\x1b[0m", dest_bin);
-                let status = Command::new("sudo")
+                let status = Command::new("pkexec")
                     .args([
                         "install",
                         "-m",
@@ -395,18 +395,36 @@ impl VlManager {
         Ok(())
     }
 
-    /// Find the directory containing a PKGBUILD (root or one level deep) and run `makepkg -si`.
+    /// Build with makepkg (as current user) then install via pkexec pacman -U
+    /// (graphical polkit prompt — no terminal required).
     async fn run_makepkg(&self, search_root: &PathBuf) -> Result<()> {
         let build_dir = find_pkgbuild_dir(search_root)?;
-        println!("\x1b[32m==> Building with makepkg -si…\x1b[0m");
+
+        // Build only — makepkg refuses to run as root so we cannot wrap this in pkexec.
+        println!("\x1b[32m==> Building with makepkg…\x1b[0m");
         let status = Command::new("makepkg")
-            .args(["-si"])
+            .args(["-s", "--noconfirm"])
             .current_dir(&build_dir)
             .status()
             .await
             .context("makepkg not found")?;
         if !status.success() {
-            anyhow::bail!("makepkg failed in {}", build_dir.display());
+            anyhow::bail!("makepkg build failed in {}", build_dir.display());
+        }
+
+        // Find the generated package archive.
+        let pkg_file = find_built_package(&build_dir)?;
+
+        // Install via pkexec — triggers the graphical polkit authentication dialog.
+        println!("\x1b[32m==> Installing via pkexec pacman -U…\x1b[0m");
+        let status = Command::new("pkexec")
+            .args(["pacman", "-U", "--noconfirm"])
+            .arg(&pkg_file)
+            .status()
+            .await
+            .context("pkexec not found")?;
+        if !status.success() {
+            anyhow::bail!("Package installation failed in {}", build_dir.display());
         }
         Ok(())
     }
@@ -423,6 +441,17 @@ fn find_pkgbuild_dir(root: &PathBuf) -> Result<PathBuf> {
         }
     }
     anyhow::bail!("No PKGBUILD found in {}", root.display())
+}
+
+fn find_built_package(dir: &PathBuf) -> Result<PathBuf> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz") {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("No .pkg.tar.zst file found in {}", dir.display())
 }
 
 // ── Manager trait impl ────────────────────────────────────────────────────────
@@ -479,20 +508,20 @@ impl Manager for VlManager {
             if is_binary {
                 let path = format!("/usr/local/bin/{}", pkg);
                 println!("\x1b[32m==> Removing {}…\x1b[0m", path);
-                let status = Command::new("sudo")
+                let status = Command::new("pkexec")
                     .args(["rm", "-f", &path])
                     .status()
                     .await
-                    .context("sudo not found")?;
+                    .context("pkexec not found")?;
                 if !status.success() {
                     anyhow::bail!("Failed to remove '{}'", path);
                 }
             } else {
-                let status = Command::new("sudo")
+                let status = Command::new("pkexec")
                     .args(["pacman", "-Rs", "--noconfirm", pkg])
                     .status()
                     .await
-                    .context("pacman not found")?;
+                    .context("pkexec not found")?;
                 if !status.success() {
                     anyhow::bail!("Failed to remove '{}'", pkg);
                 }

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 use std::fs;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 const AUR_RPC: &str = "https://aur.archlinux.org/rpc/v5";
@@ -56,7 +57,7 @@ impl AurManager {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
-                .user_agent("vpkg2/0.1 (Vertex Package Manager)")
+                .user_agent("vpkg/0.1 (Vertex Package Manager)")
                 .build()
                 .expect("failed to build HTTP client"),
         }
@@ -69,12 +70,12 @@ impl AurManager {
     }
 
     async fn build_and_install(&self, pkg_base: &str) -> Result<()> {
-        let build_dir = format!("/tmp/vpkg2-aur/{}", pkg_base);
+        let build_dir = format!("/tmp/vpkg-aur/{}", pkg_base);
 
-        if std::path::Path::new(&build_dir).exists() {
+        if Path::new(&build_dir).exists() {
             fs::remove_dir_all(&build_dir)?;
         }
-        fs::create_dir_all("/tmp/vpkg2-aur")?;
+        fs::create_dir_all("/tmp/vpkg-aur")?;
 
         let clone_url = format!("{}/{}.git", AUR_GIT, pkg_base);
         let status = Command::new("git")
@@ -87,12 +88,9 @@ impl AurManager {
         }
 
         // Show PKGBUILD
-        let pkgbuild = format!("{}/PKGBUILD", build_dir);
-        if let Ok(content) = fs::read_to_string(&pkgbuild) {
-            println!(
-                "\n\x1b[33m══ PKGBUILD for {} ══\x1b[0m\n{}",
-                pkg_base, content
-            );
+        let pkgbuild_path = format!("{}/PKGBUILD", build_dir);
+        if let Ok(content) = fs::read_to_string(&pkgbuild_path) {
+            println!("\n\x1b[33m══ PKGBUILD for {} ══\x1b[0m\n{}", pkg_base, content);
         }
 
         // Confirm
@@ -103,17 +101,45 @@ impl AurManager {
             anyhow::bail!("Cancelled by user");
         }
 
+        // Build as current user (makepkg refuses to run as root)
         let status = Command::new("makepkg")
-            .args(["-si"])
+            .args(["-s", "--noconfirm"])
             .current_dir(&build_dir)
             .status()
             .await
             .context("makepkg not found")?;
         if !status.success() {
-            anyhow::bail!("makepkg failed for '{}'", pkg_base);
+            anyhow::bail!("makepkg build failed for '{}'", pkg_base);
+        }
+
+        // Install the built package via pkexec — triggers graphical polkit prompt,
+        // no terminal required.
+        let pkg_file = find_built_package(Path::new(&build_dir))
+            .with_context(|| format!("No built package found after makepkg for '{}'", pkg_base))?;
+
+        let status = Command::new("pkexec")
+            .args(["pacman", "-U", "--noconfirm"])
+            .arg(&pkg_file)
+            .status()
+            .await
+            .context("pkexec not found")?;
+        if !status.success() {
+            anyhow::bail!("Failed to install AUR package '{}'", pkg_base);
         }
         Ok(())
     }
+}
+
+/// Find the first `.pkg.tar.zst` or `.pkg.tar.xz` in a directory.
+fn find_built_package(dir: &Path) -> Result<PathBuf> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz") {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("No .pkg.tar.zst file found in {}", dir.display())
 }
 
 #[async_trait]
@@ -143,13 +169,12 @@ impl Manager for AurManager {
     }
 
     async fn remove(&self, packages: &[String]) -> Result<()> {
-        let status = Command::new("sudo")
-            .arg("pacman")
-            .arg("-Rs")
-            .arg("--noconfirm")
+        let status = Command::new("pkexec")
+            .args(["pacman", "-Rs", "--noconfirm"])
             .args(packages)
             .status()
-            .await?;
+            .await
+            .context("pkexec not found")?;
         if !status.success() {
             anyhow::bail!("Failed to remove AUR packages");
         }
@@ -157,7 +182,6 @@ impl Manager for AurManager {
     }
 
     async fn update(&self) -> Result<()> {
-        // Identify foreign (AUR) packages, fetch their latest versions, rebuild if outdated
         let output = Command::new("pacman").args(["-Qm"]).output().await?;
         let installed: Vec<(String, String)> = String::from_utf8_lossy(&output.stdout)
             .lines()

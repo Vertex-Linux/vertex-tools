@@ -9,8 +9,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Vertex Updater")
-            .with_min_inner_size([860.0, 720.0])
-            .with_inner_size([900.0, 780.0]),
+            .with_min_inner_size([100.0, 100.0])
+            .with_inner_size([860.0, 720.0]),
         ..Default::default()
     };
 

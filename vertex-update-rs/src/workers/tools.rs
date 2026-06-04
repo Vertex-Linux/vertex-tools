@@ -89,9 +89,13 @@ pub fn run(
         }
 
         log!("\nInstalling with elevated privileges…");
+        // rm -f the destination first so we don't hit "Text file busy" when
+        // overwriting a binary that is currently running (this process).
         let cmd = files
             .iter()
-            .map(|(src, dst)| format!("cp '{}' '{}' && chmod 755 '{}'", src, dst, dst))
+            .map(|(src, dst)| {
+                format!("rm -f '{}' && cp '{}' '{}' && chmod 755 '{}'", dst, src, dst, dst)
+            })
             .collect::<Vec<_>>()
             .join(" && ");
 
@@ -142,7 +146,32 @@ pub fn run(
 
         // ── Calla Desktop ─────────────────────────────────────────────────────
         if do_calla {
-            log!("\nUpdating Calla Desktop…");
+            log!("\nSyncing package database before Calla install…");
+            // Refresh pacman's db first — otherwise pacman can't find packages
+            // and makepkg -si will fail with "database file not found" errors.
+            let sync = Command::new("pkexec")
+                .args(["pacman", "-Sy", "--noconfirm"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+
+            if let Ok(mut child) = sync {
+                let stdout = child.stdout.take().unwrap();
+                let stderr = child.stderr.take().unwrap();
+                let tx2 = tx.clone(); let ctx2 = ctx.clone();
+                let h = std::thread::spawn(move || {
+                    for l in BufReader::new(stderr).lines().flatten() {
+                        let _ = tx2.send(Msg::Log(l)); ctx2.request_repaint();
+                    }
+                });
+                for l in BufReader::new(stdout).lines().flatten() {
+                    let _ = tx.send(Msg::Log(l)); ctx.request_repaint();
+                }
+                h.join().ok();
+                child.wait().ok();
+            }
+
+            log!("Installing / updating Calla Desktop…");
             match Command::new("vpkg")
                 .args(["vl", "install", "calla", "--no-deps"])
                 .stdout(Stdio::piped())

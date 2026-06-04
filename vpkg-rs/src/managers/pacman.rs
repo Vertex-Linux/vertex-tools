@@ -24,14 +24,12 @@ impl Manager for PacmanManager {
     }
 
     async fn install(&self, packages: &[String]) -> Result<()> {
-        let status = Command::new("sudo")
-            .arg("pacman")
-            .arg("-S")
-            .arg("--noconfirm")
+        let status = Command::new("pkexec")
+            .args(["pacman", "-S", "--noconfirm"])
             .args(packages)
             .status()
             .await
-            .context("Failed to run pacman -S")?;
+            .context("pkexec not found")?;
         if !status.success() {
             anyhow::bail!("pacman failed to install packages");
         }
@@ -39,14 +37,12 @@ impl Manager for PacmanManager {
     }
 
     async fn remove(&self, packages: &[String]) -> Result<()> {
-        let status = Command::new("sudo")
-            .arg("pacman")
-            .arg("-Rs")
-            .arg("--noconfirm")
+        let status = Command::new("pkexec")
+            .args(["pacman", "-Rs", "--noconfirm"])
             .args(packages)
             .status()
             .await
-            .context("Failed to run pacman -Rs")?;
+            .context("pkexec not found")?;
         if !status.success() {
             anyhow::bail!("pacman failed to remove packages");
         }
@@ -54,11 +50,11 @@ impl Manager for PacmanManager {
     }
 
     async fn update(&self) -> Result<()> {
-        let status = Command::new("sudo")
+        let status = Command::new("pkexec")
             .args(["pacman", "-Syu", "--noconfirm"])
             .status()
             .await
-            .context("Failed to run pacman -Syu")?;
+            .context("pkexec not found")?;
         if !status.success() {
             anyhow::bail!("pacman system update failed");
         }
@@ -91,26 +87,19 @@ fn parse_search(raw: &str) -> Result<Vec<Package>> {
         if line.starts_with("    ") || line.is_empty() {
             continue;
         }
-        // "repo/name version [installed]"
         let mut parts = line.splitn(2, ' ');
         let name_part = match parts.next() {
             Some(p) => p,
             None => continue,
         };
         let rest = parts.next().unwrap_or("");
-
         let name = match name_part.find('/') {
             Some(i) => name_part[i + 1..].to_string(),
             None => name_part.to_string(),
         };
         let version = rest.split_whitespace().next().unwrap_or("").to_string();
         let installed = rest.contains("[installed]");
-
-        let desc = lines
-            .next()
-            .map(|l| l.trim().to_string())
-            .unwrap_or_default();
-
+        let desc = lines.next().map(|l| l.trim().to_string()).unwrap_or_default();
         let mut pkg = Package::new(name, version, desc, Source::Pacman);
         pkg.installed = installed;
         packages.push(pkg);
