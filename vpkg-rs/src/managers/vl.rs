@@ -36,29 +36,22 @@ struct GhAsset {
 
 // ── pkg.json schema ───────────────────────────────────────────────────────────
 
-/// Where to download the package from.
-#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DownloadSource {
     /// Hosted inside the vpkg-repo (default).
+    #[default]
     Repo,
-    /// Fetched from a GitHub repository's releases.
+    /// Fetched from a GitHub repository's releases (or cloned if no asset found).
     Github,
 }
 
-impl Default for DownloadSource {
-    fn default() -> Self {
-        DownloadSource::Repo
-    }
-}
-
-/// How to install the downloaded file.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum InstallType {
     /// `sudo pacman -U <file>` — for pre-built `.pkg.tar.zst` packages.
     Pacman,
-    /// Unzip the archive, find a PKGBUILD, run `makepkg -si`.
+    /// Unzip / clone, find a PKGBUILD, run `makepkg -si`.
     Makepkg,
     /// Copy the file directly to `/usr/local/bin/<name>` and `chmod +x`.
     Binary,
@@ -77,22 +70,24 @@ pub struct PkgJson {
     /// Filename inside the package folder (required when source = "repo").
     pub file: Option<String>,
 
-    // ── GitHub release source ─────────────────────────────────────────────────
+    // ── GitHub source ─────────────────────────────────────────────────────────
     #[serde(default)]
     pub source: DownloadSource,
 
     /// `owner/repo` — required when source = "github".
     pub github_repo: Option<String>,
 
-    /// Asset filename to download. Use `{arch}` for automatic substitution
-    /// (e.g. `"mytool-{arch}-unknown-linux-gnu"`).
+    /// Asset filename to download. Use `{arch}` for substitution.
+    /// If omitted or the asset isn't found in the release, vpkg will
+    /// `git clone` the repo and run commands from there instead.
     pub github_asset: Option<String>,
 
-    /// If set, find the latest release whose tag *contains* this keyword.
+    /// If set, find the latest release whose tag *contains* this string.
     /// If omitted, the very latest release is used.
     pub github_tag_keyword: Option<String>,
 
-    /// For `binary` installs: rename the downloaded file to this name before
+    // ── Rename ────────────────────────────────────────────────────────────────
+    /// For `binary` installs: rename the downloaded/cloned file to this before
     /// placing it in `/usr/local/bin/`. Falls back to `name` if omitted.
     #[serde(rename = "rename-file")]
     pub rename_file: Option<String>,
@@ -121,6 +116,8 @@ impl VlManager {
                 .expect("failed to build HTTP client"),
         }
     }
+
+    // ── Repo helpers ──────────────────────────────────────────────────────────
 
     async fn list_package_names(&self) -> Result<Vec<String>> {
         let entries: Vec<RepoEntry> = self
@@ -156,97 +153,53 @@ impl VlManager {
             .context("Failed to parse pkg.json")
     }
 
-    /// Resolve the download URL and the filename to save as.
-    /// For GitHub sources, `{arch}` in `github_asset` is substituted automatically.
-    async fn resolve_download(&self, pkg_name: &str, meta: &PkgJson) -> Result<(String, String)> {
-        match &meta.source {
-            DownloadSource::Repo => {
-                let file = meta
-                    .file
-                    .as_deref()
-                    .with_context(|| {
-                        format!("pkg.json for '{}' is missing the 'file' field", pkg_name)
-                    })?;
-                let url = format!("{}/{}/{}", REPO_RAW, pkg_name, file);
-                Ok((url, file.to_string()))
-            }
+    // ── GitHub helpers ────────────────────────────────────────────────────────
 
-            DownloadSource::Github => {
-                let repo = meta.github_repo.as_deref().with_context(|| {
-                    format!("pkg.json for '{}' is missing 'github_repo'", pkg_name)
-                })?;
-                let asset_template = meta.github_asset.as_deref().with_context(|| {
-                    format!("pkg.json for '{}' is missing 'github_asset'", pkg_name)
-                })?;
-
-                // Substitute {arch} → actual architecture
-                let arch = std::env::consts::ARCH; // "x86_64" | "aarch64"
-                let asset_name = asset_template.replace("{arch}", arch);
-
-                let release = self.resolve_gh_release(repo, meta.github_tag_keyword.as_deref()).await?;
-
-                println!("  Found GitHub release {}", release.tag_name);
-
-                let asset = release
-                    .assets
-                    .iter()
-                    .find(|a| a.name == asset_name)
-                    .with_context(|| {
-                        format!(
-                            "Asset '{}' not found in release {} of {}",
-                            asset_name, release.tag_name, repo
-                        )
-                    })?;
-
-                Ok((asset.browser_download_url.clone(), asset_name))
-            }
-        }
-    }
-
-    /// Fetch the correct GitHub release — either the first one whose tag contains
-    /// `tag_keyword`, or the very latest if no keyword is given.
-    async fn resolve_gh_release(&self, repo: &str, tag_keyword: Option<&str>) -> Result<GhRelease> {
+    async fn resolve_gh_release(
+        &self,
+        repo: &str,
+        tag_keyword: Option<&str>,
+    ) -> Result<GhRelease> {
         match tag_keyword {
             None => {
-                // Use the /releases/latest shortcut
                 let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
                 self.client
                     .get(&url)
                     .send()
-                    .await
-                    .context("Failed to reach GitHub API")?
-                    .error_for_status()
-                    .context("GitHub API returned an error for releases/latest")?
+                    .await?
+                    .error_for_status()?
                     .json::<GhRelease>()
                     .await
                     .context("Failed to parse GitHub release")
             }
             Some(keyword) => {
                 let url = format!("https://api.github.com/repos/{}/releases", repo);
-                let releases: Vec<GhRelease> = self
-                    .client
-                    .get(&url)
-                    .send()
-                    .await
-                    .context("Failed to reach GitHub API")?
-                    .error_for_status()
-                    .context("GitHub API returned an error for releases list")?
-                    .json()
-                    .await
-                    .context("Failed to parse GitHub releases list")?;
-
+                let releases: Vec<GhRelease> =
+                    self.client.get(&url).send().await?.error_for_status()?.json().await?;
                 releases
                     .into_iter()
                     .find(|r| r.tag_name.contains(keyword))
                     .with_context(|| {
-                        format!(
-                            "No release with tag containing '{}' found in {}",
-                            keyword, repo
-                        )
+                        format!("No release with tag containing '{}' in {}", keyword, repo)
                     })
             }
         }
     }
+
+    /// Try to find a specific release asset and return its download URL.
+    /// Returns `None` if the release or the asset doesn't exist (soft failure).
+    async fn try_find_asset(
+        &self,
+        repo: &str,
+        asset_name: &str,
+        tag_keyword: Option<&str>,
+    ) -> Option<(String /* url */, String /* filename */)> {
+        let release = self.resolve_gh_release(repo, tag_keyword).await.ok()?;
+        let asset = release.assets.iter().find(|a| a.name == asset_name)?;
+        Some((asset.browser_download_url.clone(), asset_name.to_string()))
+    }
+
+    // ── Install dispatch ──────────────────────────────────────────────────────
 
     async fn download_and_install(&self, pkg_name: &str) -> Result<()> {
         let meta = self.fetch_pkg_json(pkg_name).await?;
@@ -258,83 +211,203 @@ impl VlManager {
         }
         fs::create_dir_all(&tmp_path)?;
 
-        let (download_url, filename) = self.resolve_download(pkg_name, &meta).await?;
-        let dest = tmp_path.join(&filename);
+        if meta.source == DownloadSource::Github {
+            let repo = meta
+                .github_repo
+                .as_deref()
+                .with_context(|| format!("pkg.json for '{}' is missing 'github_repo'", pkg_name))?;
 
+            // Try to resolve a release asset when one is specified
+            let asset_result = if let Some(tmpl) = &meta.github_asset {
+                let asset_name = tmpl.replace("{arch}", std::env::consts::ARCH);
+                self.try_find_asset(repo, &asset_name, meta.github_tag_keyword.as_deref()).await
+            } else {
+                None
+            };
+
+            return match asset_result {
+                Some((url, filename)) => {
+                    // Asset found — download it and install
+                    let dest = tmp_path.join(&filename);
+                    println!(
+                        "\x1b[32m==> Downloading {} {} from GitHub release…\x1b[0m",
+                        meta.name, meta.version
+                    );
+                    let bytes = self
+                        .client
+                        .get(&url)
+                        .send()
+                        .await
+                        .context("Download failed")?
+                        .error_for_status()
+                        .context("Server error during download")?
+                        .bytes()
+                        .await?;
+                    fs::write(&dest, &bytes)?;
+                    println!("  {} downloaded ({} KB)", filename, bytes.len() / 1024);
+                    self.run_install(&meta, &dest, &tmp_path).await
+                }
+                None => {
+                    // No asset specified or not found in the release — fall back to git clone
+                    self.install_from_git_clone(&meta, &tmp_path, repo).await
+                }
+            };
+        }
+
+        // Repo-hosted source
+        let file = meta.file.as_deref().with_context(|| {
+            format!("pkg.json for '{}' is missing the 'file' field", pkg_name)
+        })?;
+        let url = format!("{}/{}/{}", REPO_RAW, pkg_name, file);
+        let dest = tmp_path.join(file);
         println!(
-            "\x1b[32m==> Downloading {} {}…\x1b[0m",
+            "\x1b[32m==> Downloading {} {} from VL repo…\x1b[0m",
             meta.name, meta.version
         );
         let bytes = self
             .client
-            .get(&download_url)
+            .get(&url)
             .send()
             .await
             .context("Failed to download package file")?
             .error_for_status()
-            .with_context(|| format!("Download URL returned an error for '{}'", filename))?
+            .with_context(|| format!("File '{}' not found in VL repo", file))?
             .bytes()
             .await?;
         fs::write(&dest, &bytes)?;
-        println!("  {} downloaded ({} KB)", filename, bytes.len() / 1024);
+        println!("  {} downloaded ({} KB)", file, bytes.len() / 1024);
+        self.run_install(&meta, &dest, &tmp_path).await
+    }
 
+    /// Install a file that has already been downloaded to `dest`.
+    async fn run_install(&self, meta: &PkgJson, dest: &PathBuf, tmp_path: &PathBuf) -> Result<()> {
         match meta.install_type {
             InstallType::Pacman => {
                 println!("\x1b[32m==> Installing via pacman -U…\x1b[0m");
                 let status = Command::new("sudo")
                     .args(["pacman", "-U", "--noconfirm"])
-                    .arg(&dest)
+                    .arg(dest)
                     .status()
                     .await
                     .context("pacman not found")?;
                 if !status.success() {
-                    anyhow::bail!("pacman -U failed for '{}'", pkg_name);
+                    anyhow::bail!("pacman -U failed for '{}'", meta.name);
                 }
             }
-
             InstallType::Makepkg => {
-                println!("\x1b[32m==> Extracting {}…\x1b[0m", filename);
+                println!("\x1b[32m==> Extracting {}…\x1b[0m", dest.display());
                 let status = Command::new("unzip")
-                    .args(["-q", dest.to_str().unwrap_or(""), "-d", &tmp_dir])
+                    .args(["-q", dest.to_str().unwrap_or(""), "-d", tmp_path.to_str().unwrap_or("")])
                     .status()
                     .await
-                    .context("unzip not found — install it with: vpkg pm install unzip")?;
+                    .context("unzip not found — install with: vpkg pm install unzip")?;
                 if !status.success() {
-                    anyhow::bail!("Failed to extract '{}'", filename);
+                    anyhow::bail!("Failed to extract archive");
                 }
-
-                let build_dir = find_pkgbuild_dir(&tmp_path)?;
-                println!("\x1b[32m==> Building with makepkg -si…\x1b[0m");
-                let status = Command::new("makepkg")
-                    .args(["-si"])
-                    .current_dir(&build_dir)
-                    .status()
-                    .await
-                    .context("makepkg not found")?;
-                if !status.success() {
-                    anyhow::bail!("makepkg failed for '{}'", pkg_name);
-                }
+                self.run_makepkg(tmp_path).await?;
             }
-
             InstallType::Binary => {
                 let bin_name = meta.rename_file.as_deref().unwrap_or(&meta.name);
                 let dest_bin = format!("/usr/local/bin/{}", bin_name);
-                println!(
-                    "\x1b[32m==> Installing binary to {}…\x1b[0m",
-                    dest_bin
-                );
+                println!("\x1b[32m==> Installing binary → {}…\x1b[0m", dest_bin);
                 let status = Command::new("sudo")
                     .args(["install", "-m", "755", dest.to_str().unwrap_or(""), &dest_bin])
                     .status()
                     .await
                     .context("sudo not found")?;
                 if !status.success() {
-                    anyhow::bail!("Failed to install binary '{}' to {}", bin_name, dest_bin);
+                    anyhow::bail!("Failed to install binary to {}", dest_bin);
                 }
                 println!("  Installed {} → {}", bin_name, dest_bin);
             }
         }
+        Ok(())
+    }
 
+    /// Clone the GitHub repo and install directly from the repo root.
+    /// Used when no `github_asset` is specified or the asset isn't found in any release.
+    async fn install_from_git_clone(
+        &self,
+        meta: &PkgJson,
+        tmp_path: &PathBuf,
+        repo: &str,
+    ) -> Result<()> {
+        let clone_url = format!("https://github.com/{}.git", repo);
+        let clone_dir = tmp_path.join("repo");
+
+        println!(
+            "\x1b[32m==> No release asset — cloning {} …\x1b[0m",
+            repo
+        );
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "--depth=1",
+                &clone_url,
+                clone_dir.to_str().unwrap_or(""),
+            ])
+            .status()
+            .await
+            .context("git not found")?;
+        if !status.success() {
+            anyhow::bail!("Failed to clone {}", clone_url);
+        }
+
+        match meta.install_type {
+            InstallType::Makepkg => {
+                self.run_makepkg(&clone_dir).await?;
+            }
+            InstallType::Binary => {
+                let bin_name = meta.rename_file.as_deref().unwrap_or(&meta.name);
+                // Look for the binary in the repo root
+                let bin_in_repo = clone_dir.join(bin_name);
+                if !bin_in_repo.exists() {
+                    anyhow::bail!(
+                        "Binary '{}' not found in cloned repo root of {}",
+                        bin_name,
+                        repo
+                    );
+                }
+                let dest_bin = format!("/usr/local/bin/{}", bin_name);
+                println!("\x1b[32m==> Installing binary → {}…\x1b[0m", dest_bin);
+                let status = Command::new("sudo")
+                    .args([
+                        "install",
+                        "-m",
+                        "755",
+                        bin_in_repo.to_str().unwrap_or(""),
+                        &dest_bin,
+                    ])
+                    .status()
+                    .await?;
+                if !status.success() {
+                    anyhow::bail!("Failed to install binary to {}", dest_bin);
+                }
+                println!("  Installed {} → {}", bin_name, dest_bin);
+            }
+            InstallType::Pacman => {
+                anyhow::bail!(
+                    "pacman install type requires a release asset — \
+                     add 'github_asset' to pkg.json or upload a release"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Find the directory containing a PKGBUILD (root or one level deep) and run `makepkg -si`.
+    async fn run_makepkg(&self, search_root: &PathBuf) -> Result<()> {
+        let build_dir = find_pkgbuild_dir(search_root)?;
+        println!("\x1b[32m==> Building with makepkg -si…\x1b[0m");
+        let status = Command::new("makepkg")
+            .args(["-si"])
+            .current_dir(&build_dir)
+            .status()
+            .await
+            .context("makepkg not found")?;
+        if !status.success() {
+            anyhow::bail!("makepkg failed in {}", build_dir.display());
+        }
         Ok(())
     }
 }
@@ -349,7 +422,7 @@ fn find_pkgbuild_dir(root: &PathBuf) -> Result<PathBuf> {
             return Ok(path);
         }
     }
-    anyhow::bail!("No PKGBUILD found in extracted zip archive")
+    anyhow::bail!("No PKGBUILD found in {}", root.display())
 }
 
 // ── Manager trait impl ────────────────────────────────────────────────────────
@@ -374,14 +447,7 @@ impl Manager for VlManager {
             let client = client.clone();
             async move {
                 let url = format!("{}/{}/pkg.json", REPO_RAW, folder);
-                let meta = client
-                    .get(&url)
-                    .send()
-                    .await
-                    .ok()?
-                    .json::<PkgJson>()
-                    .await
-                    .ok()?;
+                let meta = client.get(&url).send().await.ok()?.json::<PkgJson>().await.ok()?;
                 Some(Package::new(
                     meta.name,
                     meta.version,
@@ -404,7 +470,6 @@ impl Manager for VlManager {
 
     async fn remove(&self, packages: &[String]) -> Result<()> {
         for pkg in packages {
-            // Try to read pkg.json to determine if it was a binary install
             let is_binary = self
                 .fetch_pkg_json(pkg)
                 .await
@@ -413,7 +478,7 @@ impl Manager for VlManager {
 
             if is_binary {
                 let path = format!("/usr/local/bin/{}", pkg);
-                println!("\x1b[32m==> Removing binary {}…\x1b[0m", path);
+                println!("\x1b[32m==> Removing {}…\x1b[0m", path);
                 let status = Command::new("sudo")
                     .args(["rm", "-f", &path])
                     .status()
@@ -423,7 +488,6 @@ impl Manager for VlManager {
                     anyhow::bail!("Failed to remove '{}'", path);
                 }
             } else {
-                // Pacman / makepkg packages land in pacman's DB
                 let status = Command::new("sudo")
                     .args(["pacman", "-Rs", "--noconfirm", pkg])
                     .status()
