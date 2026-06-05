@@ -161,7 +161,7 @@ pub fn run(
                 log!("  Building package…");
                 let ok = run_streaming(
                     "makepkg",
-                    &["-s"],
+                    &["-sf", "--noconfirm"],
                     Some("/tmp/calla-upd"),
                     &tx, &ctx,
                 );
@@ -180,7 +180,7 @@ pub fn run(
                             let ok = run_streaming(
                                 "pkexec",
                                 &["pacman", "-U", "--noconfirm", &pkg],
-                                Some("/tmp/calla-upd"),
+                                None,
                                 &tx, &ctx,
                             );
                             if !ok {
