@@ -142,14 +142,12 @@ pub fn run(
         if do_calla {
             log!("\nUpdating Calla Desktop…");
 
-            // Clean any previous build dir
             let _ = std::fs::remove_dir_all("/tmp/calla-upd");
 
-            // 1. git clone
             log!("  Cloning Vertex-Linux/Calla…");
             let ok = run_streaming(
                 "git",
-                &["clone", "https://github.com/Vertex-Linux/Calla.git", "/tmp/calla-upd/"],
+                &["clone", "--depth=1", "https://github.com/Vertex-Linux/Calla.git", "/tmp/calla-upd"],
                 None,
                 &tx, &ctx,
             );
@@ -157,38 +155,27 @@ pub fn run(
                 log!("  [error] git clone failed");
                 errors += 1;
             } else {
-                // 2. pkexec makepkg -sl  (build + sync deps, no install step)
-                log!("  Building package…");
+                log!("  Installing files…");
+                // Copy files directly — skip makepkg/pacman to avoid version-check
+                // skips and PKGDEST redirects. pkexec gives us root for the write.
+                let cmd = concat!(
+                    "cp -r /tmp/calla-upd/src/usr/share/calla /usr/share/ && ",
+                    "cp -r /tmp/calla-upd/src/usr/share/xsessions/calla.desktop /usr/share/xsessions/ && ",
+                    "cp /tmp/calla-upd/src/usr/bin/calla /usr/bin/calla && ",
+                    "cp /tmp/calla-upd/src/etc/pam.d/awesome /etc/pam.d/awesome && ",
+                    "rm -rf /tmp/calla-upd"
+                );
                 let ok = run_streaming(
-                    "makepkg",
-                    &["-sf", "--noconfirm"],
-                    Some("/tmp/calla-upd"),
+                    "pkexec",
+                    &["bash", "-c", cmd],
+                    None,
                     &tx, &ctx,
                 );
                 if !ok {
-                    log!("  [error] makepkg failed");
+                    log!("  [error] file install failed");
                     errors += 1;
                 } else {
-                    // 3. find the built .pkg.tar.zst and install it
-                    match find_built_pkg("/tmp/calla-upd") {
-                        Err(e) => {
-                            log!("  [error] {e}");
-                            errors += 1;
-                        }
-                        Ok(pkg) => {
-                            log!("  Installing {}…", pkg);
-                            let ok = run_streaming(
-                                "pkexec",
-                                &["pacman", "-U", "--noconfirm", &pkg],
-                                None,
-                                &tx, &ctx,
-                            );
-                            if !ok {
-                                log!("  [error] pacman -U failed");
-                                errors += 1;
-                            }
-                        }
-                    }
+                    log!("  Calla updated successfully.");
                 }
             }
         }
