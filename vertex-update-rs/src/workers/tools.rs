@@ -80,68 +80,63 @@ pub fn run(
             }
         }
 
-        if files.is_empty() {
-            log!("Nothing downloaded — cannot install.");
-            let _ = tx.send(Msg::Done(false));
-            ctx.request_repaint();
-            return;
-        }
-
-        log!("\nInstalling with elevated privileges…");
-        // rm -f the destination first so we don't hit "Text file busy" when
-        // overwriting a binary that is currently running (this process).
-        let cmd = files
-            .iter()
-            .map(|(src, dst)| {
-                format!("rm -f '{}' && cp '{}' '{}' && chmod 755 '{}'", dst, src, dst, dst)
-            })
-            .collect::<Vec<_>>()
-            .join(" && ");
-
-        let mut child = Command::new("pkexec")
-            .args(["bash", "-c", &cmd])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("pkexec not found");
-
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let tx2 = tx.clone();
-        let ctx2 = ctx.clone();
-        let h = std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().flatten() {
-                let _ = tx2.send(Msg::Log(line));
-                ctx2.request_repaint();
-            }
-        });
-        for line in BufReader::new(stdout).lines().flatten() {
-            let _ = tx.send(Msg::Log(line));
-            ctx.request_repaint();
-        }
-        h.join().ok();
-
-        let status = child.wait().unwrap();
-        for (src, _) in &files {
-            let _ = std::fs::remove_file(src);
-        }
-
-        if status.success() {
-            log!("\nAll tools installed successfully.");
-            if files
+        if !files.is_empty() {
+            log!("\nInstalling with elevated privileges…");
+            // rm -f the destination first so we don't hit "Text file busy" when
+            // overwriting a binary that is currently running (this process).
+            let cmd = files
                 .iter()
-                .any(|(_, dst)| dst == "/usr/local/bin/vertex-update")
-            {
-                let _ = tx.send(Msg::SelfUpdated);
+                .map(|(src, dst)| {
+                    format!("rm -f '{}' && cp '{}' '{}' && chmod 755 '{}'", dst, src, dst, dst)
+                })
+                .collect::<Vec<_>>()
+                .join(" && ");
+
+            let mut child = Command::new("pkexec")
+                .args(["bash", "-c", &cmd])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("pkexec not found");
+
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let tx2 = tx.clone();
+            let ctx2 = ctx.clone();
+            let h = std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().flatten() {
+                    let _ = tx2.send(Msg::Log(line));
+                    ctx2.request_repaint();
+                }
+            });
+            for line in BufReader::new(stdout).lines().flatten() {
+                let _ = tx.send(Msg::Log(line));
                 ctx.request_repaint();
             }
-        } else {
-            log!(
-                "\n[install exited with code {}]",
-                status.code().unwrap_or(-1)
-            );
-            errors += 1;
-        }
+            h.join().ok();
+
+            let status = child.wait().unwrap();
+            for (src, _) in &files {
+                let _ = std::fs::remove_file(src);
+            }
+
+            if status.success() {
+                log!("\nAll tools installed successfully.");
+                if files
+                    .iter()
+                    .any(|(_, dst)| dst == "/usr/local/bin/vertex-update")
+                {
+                    let _ = tx.send(Msg::SelfUpdated);
+                    ctx.request_repaint();
+                }
+            } else {
+                log!(
+                    "\n[install exited with code {}]",
+                    status.code().unwrap_or(-1)
+                );
+                errors += 1;
+            }
+        } // end !files.is_empty()
 
         // ── Calla Desktop ─────────────────────────────────────────────────────
         if do_calla {
