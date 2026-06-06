@@ -53,6 +53,9 @@ pub struct Terminal {
     saved_col: usize,
     saved_row: usize,
 
+    // DEC private mode: set when shell sends \x1b[?2004h
+    pub bracketed_paste: bool,
+
     // Pending byte buffer (for multi-byte UTF-8 from PTY reads)
     pub pending: Vec<u8>,
 }
@@ -76,6 +79,7 @@ impl Terminal {
             cur_inverse: false,
             saved_col: 0,
             saved_row: 0,
+            bracketed_paste: false,
             pending: Vec::new(),
         }
     }
@@ -224,12 +228,21 @@ impl Perform for Terminal {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let p: Vec<u16> = params.iter()
             .filter_map(|s| s.first().copied())
             .collect();
         let p0 = *p.first().unwrap_or(&0) as usize;
         let p1 = *p.get(1).unwrap_or(&0) as usize;
+
+        // DEC private modes: \x1b[?<n>h / \x1b[?<n>l
+        if intermediates.first() == Some(&b'?') {
+            match (action, p0) {
+                ('h', 2004) => { self.bracketed_paste = true; return; }
+                ('l', 2004) => { self.bracketed_paste = false; return; }
+                _ => { return; }
+            }
+        }
 
         match action {
             'A' => self.cursor_row = self.cursor_row.saturating_sub(p0.max(1)),

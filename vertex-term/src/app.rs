@@ -5,6 +5,7 @@ use crate::{
     terminal::Terminal,
     theme::{self, Theme},
 };
+
 use egui::{
     text::LayoutJob, Color32, FontFamily, FontId, Key, Margin, Modifiers, ScrollArea, TextFormat,
     Vec2,
@@ -24,6 +25,14 @@ pub struct VertexTerm {
     user_themes: Vec<Theme>,
     /// False until the first update() so blur is applied after the window is mapped.
     blur_applied: bool,
+    /// Some(pos) while the right-click context menu is open.
+    ctx_menu_pos: Option<egui::Pos2>,
+    /// Text selection: (row, col) in absolute terminal coordinates (scrollback + grid).
+    sel_start: Option<(usize, usize)>,
+    sel_end:   Option<(usize, usize)>,
+    /// Persistent clipboard handle — kept alive so X11 clipboard ownership is
+    /// maintained between set_text and the next get_text call.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 impl VertexTerm {
@@ -49,6 +58,10 @@ impl VertexTerm {
             shell_input,
             user_themes,
             blur_applied: false,
+            ctx_menu_pos: None,
+            sel_start: None,
+            sel_end:   None,
+            clipboard: arboard::Clipboard::new().ok(),
         }
     }
 
@@ -57,11 +70,6 @@ impl VertexTerm {
         for byte in bytes {
             self.parser.advance(&mut self.terminal, byte);
         }
-    }
-
-    // Returns (cell_width, cell_height) — no item spacing included, we zero it.
-    fn cell_size(font_size: f32) -> Vec2 {
-        Vec2::new(font_size * 0.601, font_size * 1.2)
     }
 
     fn apply_visuals(&self, ctx: &egui::Context) {
@@ -90,15 +98,18 @@ impl VertexTerm {
         ctx.set_visuals(vis);
     }
 
-    fn render_terminal(&mut self, ui: &mut egui::Ui) {
-        // Zero row spacing so virtual height matches actual rendered height exactly.
+    fn render_terminal(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing.y = 0.0;
 
         let font_size = self.config.font_size;
-        let cell_sz = Self::cell_size(font_size);
+        let font_id   = FontId::new(font_size, FontFamily::Monospace);
 
-        // Resize terminal to fill available space before creating the scroll area,
-        // so show_rows gets the correct row count on the same frame.
+        // Use the real egui font row-height so show_rows virtualisation and our
+        // pixel→cell maths both agree with what's actually rendered.
+        let cell_h = ctx.fonts(|f| f.row_height(&font_id));
+        let cell_w = font_size * 0.601;
+        let cell_sz = Vec2::new(cell_w, cell_h);
+
         let avail = ui.available_size();
         let new_cols = ((avail.x / cell_sz.x).floor() as usize).max(4);
         let new_rows = ((avail.y / cell_sz.y).floor() as usize).max(2);
@@ -108,16 +119,27 @@ impl VertexTerm {
         }
 
         let total_lines = self.terminal.scrollback.len() + self.terminal.rows;
-        let font_id = FontId::new(font_size, FontFamily::Monospace);
-        let theme = self.theme.clone();
+        let theme        = self.theme.clone();
         let cursor_visible = self.cursor_visible;
-        let opacity = self.config.opacity;
+        let opacity      = self.config.opacity;
+        let sel          = self.normalized_selection();
+
+        // Captured inside show_rows to get the exact screen position of the
+        // first rendered row — avoids any ambiguity about inner_rect semantics.
+        let mut first_row_screen_y = 0.0_f32;
+        let mut first_rendered_row = 0_usize;
+        let mut content_left_x    = 0.0_f32;
 
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(self.terminal.scroll_offset == 0)
             .show_rows(ui, cell_sz.y, total_lines, |ui, row_range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
+                // Record position before rendering any rows.
+                first_rendered_row = row_range.start;
+                let cur = ui.cursor();
+                first_row_screen_y = cur.min.y;
+                content_left_x     = cur.min.x;
                 let scrollback_len = self.terminal.scrollback.len();
                 for row_idx in row_range {
                     let row: &Vec<crate::terminal::Cell> = if row_idx < scrollback_len {
@@ -128,36 +150,78 @@ impl VertexTerm {
                     let is_active_row = row_idx >= scrollback_len
                         && (row_idx - scrollback_len) == self.terminal.cursor_row;
 
-                    // Batch consecutive cells that share the same visual style into one
-                    // LayoutJob segment instead of one segment per character (80→ typically
-                    // 3-10 segments per row), which cuts text layout cost ~10-20×.
                     let mut job = LayoutJob::default();
                     let mut col = 0usize;
                     while col < row.len() {
-                        let (fg0, bg0, it0, ul0) = cell_style(&row[col], col, is_active_row, self.terminal.cursor_col, cursor_visible, &theme, opacity);
+                        let isel0 = sel.map_or(false, |s| is_cell_selected(row_idx, col, s));
+                        let (fg0, bg0, it0, ul0) = cell_style(&row[col], col, is_active_row, self.terminal.cursor_col, cursor_visible, &theme, opacity, isel0);
                         let mut run = String::new();
                         while col < row.len() {
-                            let (fg, bg, it, ul) = cell_style(&row[col], col, is_active_row, self.terminal.cursor_col, cursor_visible, &theme, opacity);
+                            let isel = sel.map_or(false, |s| is_cell_selected(row_idx, col, s));
+                            let (fg, bg, it, ul) = cell_style(&row[col], col, is_active_row, self.terminal.cursor_col, cursor_visible, &theme, opacity, isel);
                             if fg != fg0 || bg != bg0 || it != it0 || ul != ul0 { break; }
                             run.push(if row[col].ch == '\0' { ' ' } else { row[col].ch });
                             col += 1;
                         }
-                        job.append(
-                            &run,
-                            0.0,
-                            TextFormat {
-                                font_id: font_id.clone(),
-                                color: fg0,
-                                background: bg0,
-                                italics: it0,
-                                underline: if ul0 { egui::Stroke::new(1.0, fg0) } else { egui::Stroke::NONE },
-                                ..Default::default()
-                            },
-                        );
+                        job.append(&run, 0.0, TextFormat {
+                            font_id: font_id.clone(),
+                            color: fg0,
+                            background: bg0,
+                            italics: it0,
+                            underline: if ul0 { egui::Stroke::new(1.0, fg0) } else { egui::Stroke::NONE },
+                            ..Default::default()
+                        });
                     }
-                    ui.label(job);
+                    ui.add(egui::Label::new(job).selectable(false));
                 }
             });
+
+        // ── Mouse selection ────────────────────────────────────────────────────
+        // Skip all pointer handling while the context menu is open — otherwise
+        // clicking a menu item would fire just_pressed inside inner_rect and
+        // overwrite sel_start before the menu's Copy handler can read it.
+        if self.ctx_menu_pos.is_some() { return; }
+
+        let cols = self.terminal.cols;
+
+        // pixel → (abs_row, col): offset from the actual screen position of the
+        // first rendered row, then add first_rendered_row to get absolute index.
+        let pixel_to_cell = |pos: egui::Pos2| -> (usize, usize) {
+            let rows_from_first = ((pos.y - first_row_screen_y) / cell_sz.y) as isize;
+            let abs_row = (first_rendered_row as isize + rows_from_first)
+                .clamp(0, total_lines as isize - 1) as usize;
+            let col = ((pos.x - content_left_x).max(0.0) / cell_sz.x) as usize;
+            (abs_row, col.min(cols.saturating_sub(1)))
+        };
+
+        let (just_pressed, primary_down, ptr_pos, just_released) = ctx.input(|i| {
+            let pressed = i.events.iter().any(|e| matches!(e,
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary, pressed: true, pos: p, ..
+                // Only start selection for clicks within the terminal content area.
+                } if p.y >= first_row_screen_y && p.x >= content_left_x
+            ));
+            let released = i.events.iter().any(|e| matches!(e,
+                egui::Event::PointerButton { button: egui::PointerButton::Primary, pressed: false, .. }
+            ));
+            (pressed, i.pointer.button_down(egui::PointerButton::Primary), i.pointer.interact_pos(), released)
+        });
+
+        if just_pressed {
+            if let Some(pos) = ptr_pos {
+                self.sel_start = Some(pixel_to_cell(pos));
+                self.sel_end   = None;
+            }
+        } else if primary_down && self.sel_start.is_some() {
+            if let Some(pos) = ptr_pos {
+                self.sel_end = Some(pixel_to_cell(pos));
+            }
+        }
+
+        if just_released && (self.sel_end.is_none() || self.sel_start == self.sel_end) {
+            self.sel_start = None;
+            self.sel_end   = None;
+        }
     }
 
     fn settings_panel(&mut self, ctx: &egui::Context) -> bool {
@@ -327,14 +391,88 @@ impl VertexTerm {
                         self.terminal.scroll_offset = 0;
                     }
                     egui::Event::Paste(text) => {
-                        self.pty.write_bytes(b"\x1b[200~");
+                        if self.terminal.bracketed_paste { self.pty.write_bytes(b"\x1b[200~"); }
                         self.pty.write_bytes(text.as_bytes());
-                        self.pty.write_bytes(b"\x1b[201~");
+                        if self.terminal.bracketed_paste { self.pty.write_bytes(b"\x1b[201~"); }
+                        self.sel_start = None;
+                        self.sel_end   = None;
                     }
                     _ => {}
                 }
             }
         });
+    }
+
+    /// Returns (start_row, start_col, end_row, end_col) with start ≤ end.
+    fn normalized_selection(&self) -> Option<(usize, usize, usize, usize)> {
+        let s = self.sel_start?;
+        let e = self.sel_end.unwrap_or(s);
+        if s.0 < e.0 || (s.0 == e.0 && s.1 <= e.1) {
+            Some((s.0, s.1, e.0, e.1))
+        } else {
+            Some((e.0, e.1, s.0, s.1))
+        }
+    }
+
+    /// Returns the text covered by the current selection, or None if nothing is selected.
+    fn selected_text(&self) -> Option<String> {
+        let (sr, sc, er, ec) = self.normalized_selection()?;
+        if sr == er && sc == ec { return None; }
+        let sb_len = self.terminal.scrollback.len();
+        let mut lines: Vec<String> = Vec::new();
+        for row_idx in sr..=er {
+            let row: &Vec<crate::terminal::Cell> = if row_idx < sb_len {
+                &self.terminal.scrollback[row_idx]
+            } else {
+                let g = row_idx - sb_len;
+                if g < self.terminal.grid.len() { &self.terminal.grid[g] } else { continue; }
+            };
+            let col_start = if row_idx == sr { sc.min(row.len()) } else { 0 };
+            let col_end   = if row_idx == er { (ec + 1).min(row.len()) } else { row.len() };
+            let col_end   = col_end.max(col_start);
+            let line: String = row[col_start..col_end]
+                .iter()
+                .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                .collect();
+            lines.push(line.trim_end().to_string());
+        }
+        let text = lines.join("\n").trim_end().to_string();
+        if text.is_empty() { None } else { Some(text) }
+    }
+
+    fn terminal_visible_text(&self) -> String {
+        self.terminal
+            .grid
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_string()
+    }
+
+    fn terminal_all_text(&self) -> String {
+        self.terminal
+            .scrollback
+            .iter()
+            .chain(self.terminal.grid.iter())
+            .map(|row| {
+                row.iter()
+                    .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_string()
     }
 
     fn open_settings(&mut self) {
@@ -350,6 +488,8 @@ impl VertexTerm {
         self.parser = Parser::new();
         self.cursor_visible = true;
         self.last_blink = std::time::Instant::now();
+        self.sel_start = None;
+        self.sel_end   = None;
         if let Ok(pty) = Pty::spawn(&self.config.shell, cols, rows) {
             self.pty = pty;
         }
@@ -366,7 +506,28 @@ impl eframe::App for VertexTerm {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_pty_output();
-        self.handle_keyboard(ctx);
+
+        // Detect right-click via raw events — reliable even when label widgets
+        // consume the secondary pointer click for their own text-selection sense.
+        let right_click_pos = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    ..
+                } => Some(*pos),
+                _ => None,
+            })
+        });
+        if let Some(pos) = right_click_pos {
+            self.ctx_menu_pos = Some(pos);
+        }
+
+        // Only forward keyboard input to the PTY when the context menu is closed.
+        if self.ctx_menu_pos.is_none() {
+            self.handle_keyboard(ctx);
+        }
 
         // Apply KDE blur once the window is mapped (after the first rendered frame).
         if !self.blur_applied {
@@ -443,13 +604,73 @@ impl eframe::App for VertexTerm {
         egui::CentralPanel::default()
             .frame(no_frame)
             .show(ctx, |ui| {
-                self.render_terminal(ui);
+                self.render_terminal(ctx, ui);
             });
 
         if self.show_settings {
             if self.settings_panel(ctx) {
                 self.restart_session();
             }
+        }
+
+        // Right-click context menu — rendered as a floating Area so it works
+        // regardless of what the ScrollArea inside render_terminal has claimed.
+        let mut close_ctx_menu = false;
+        if let Some(pos) = self.ctx_menu_pos {
+            egui::Area::new(egui::Id::new("term_ctx_menu"))
+                .fixed_pos(pos)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::menu(&ctx.style()).show(ui, |ui| {
+                        ui.set_min_width(130.0);
+                        if ui.button("Copy").clicked() {
+                            if let Some(text) = self.selected_text() {
+                                if let Some(ref mut cb) = self.clipboard {
+                                    let _ = cb.set_text(text);
+                                }
+                            }
+                            self.sel_start = None;
+                            self.sel_end   = None;
+                            close_ctx_menu = true;
+                        }
+                        if ui.button("Paste").clicked() {
+                            let text = self.clipboard
+                                .as_mut()
+                                .and_then(|cb| cb.get_text().ok());
+                            if let Some(text) = text {
+                                if self.terminal.bracketed_paste { self.pty.write_bytes(b"\x1b[200~"); }
+                                self.pty.write_bytes(text.as_bytes());
+                                if self.terminal.bracketed_paste { self.pty.write_bytes(b"\x1b[201~"); }
+                            }
+                            self.sel_start = None;
+                            self.sel_end   = None;
+                            close_ctx_menu = true;
+                        }
+                        ui.separator();
+                        if ui.button("Select All").clicked() {
+                            let total = self.terminal.scrollback.len() + self.terminal.rows;
+                            self.sel_start = Some((0, 0));
+                            self.sel_end   = Some((
+                                total.saturating_sub(1),
+                                self.terminal.cols.saturating_sub(1),
+                            ));
+                            let text = self.terminal_all_text();
+                            if let Some(ref mut cb) = self.clipboard {
+                                let _ = cb.set_text(text);
+                            }
+                            close_ctx_menu = true;
+                        }
+                    });
+                });
+
+            // Close on any left-click (on a menu item sets close_ctx_menu first,
+            // clicking outside is caught by primary_clicked).
+            if !close_ctx_menu && ctx.input(|i| i.pointer.primary_clicked()) {
+                close_ctx_menu = true;
+            }
+        }
+        if close_ctx_menu {
+            self.ctx_menu_pos = None;
         }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -469,6 +690,7 @@ fn cell_style(
     cursor_visible: bool,
     theme: &crate::theme::Theme,
     opacity: f32,
+    is_selected: bool,
 ) -> (Color32, Color32, bool, bool) {
     use crate::terminal::CellColor;
 
@@ -491,8 +713,19 @@ fn cell_style(
     if is_cursor {
         std::mem::swap(&mut fg, &mut bg);
         bg = with_opacity(theme.cursor_color(), opacity.max(0.6));
+    } else if is_selected {
+        bg = with_opacity(theme.selection_color(), opacity.max(0.6));
     }
     (fg, bg, cell.italic, cell.underline)
+}
+
+fn is_cell_selected(row: usize, col: usize, sel: (usize, usize, usize, usize)) -> bool {
+    let (sr, sc, er, ec) = sel;
+    if row < sr || row > er { return false; }
+    if sr == er { return col >= sc && col <= ec; }
+    if row == sr { return col >= sc; }
+    if row == er { return col <= ec; }
+    true
 }
 
 fn with_opacity(c: Color32, opacity: f32) -> Color32 {

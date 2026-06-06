@@ -17,6 +17,7 @@ toml        = "0.8"
 anyhow      = "1"
 dirs-next   = "2"
 x11rb       = { version = "0.13", features = ["allow-unsafe-code"] }
+arboard     = "3"
 
 [profile.release]
 opt-level = 3
