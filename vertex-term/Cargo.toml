@@ -1,0 +1,24 @@
+[package]
+name = "vertex-term"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "vertex-term"
+path = "src/main.rs"
+
+[dependencies]
+eframe      = "0.29"
+egui        = "0.29"
+portable-pty = "0.8"
+vte         = "0.13"
+serde       = { version = "1", features = ["derive"] }
+toml        = "0.8"
+anyhow      = "1"
+dirs-next   = "2"
+x11rb       = { version = "0.13", features = ["allow-unsafe-code"] }
+
+[profile.release]
+opt-level = 3
+strip     = true
+lto       = true
