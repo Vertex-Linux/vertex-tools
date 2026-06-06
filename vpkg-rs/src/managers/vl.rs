@@ -92,6 +92,31 @@ pub struct PkgJson {
     #[serde(rename = "rename-file")]
     pub rename_file: Option<String>,
 
+    // ── Desktop entry ─────────────────────────────────────────────────────────
+    /// If true, create a .desktop file in /usr/share/applications/ after install.
+    #[serde(default, rename = "create-desktop")]
+    pub create_desktop: bool,
+
+    /// Human-readable app name shown in launchers. Defaults to `name`.
+    #[serde(rename = "desktop-name")]
+    pub desktop_name: Option<String>,
+
+    /// Short description shown in launchers. Defaults to `description`.
+    #[serde(rename = "desktop-comment")]
+    pub desktop_comment: Option<String>,
+
+    /// XDG categories string, e.g. `"Utility;System;"`. Defaults to `"Application;"`.
+    #[serde(rename = "desktop-categories")]
+    pub desktop_categories: Option<String>,
+
+    /// Command used in the Exec= field. Defaults to `rename-file` or `name`.
+    #[serde(rename = "desktop-exec")]
+    pub desktop_exec: Option<String>,
+
+    /// Icon filename inside the package's repo folder (e.g. `"myapp.png"`).
+    /// Fetched from the vpkg-repo and installed to /usr/share/pixmaps/.
+    pub icon: Option<String>,
+
     // ── Dependencies ──────────────────────────────────────────────────────────
     #[serde(default)]
     pub pm: Vec<String>,
@@ -225,9 +250,8 @@ impl VlManager {
                 None
             };
 
-            return match asset_result {
+            match asset_result {
                 Some((url, filename)) => {
-                    // Asset found — download it and install
                     let dest = tmp_path.join(&filename);
                     println!(
                         "\x1b[32m==> Downloading {} {} from GitHub release…\x1b[0m",
@@ -245,13 +269,17 @@ impl VlManager {
                         .await?;
                     fs::write(&dest, &bytes)?;
                     println!("  {} downloaded ({} KB)", filename, bytes.len() / 1024);
-                    self.run_install(&meta, &dest, &tmp_path).await
+                    self.run_install(&meta, &dest, &tmp_path).await?;
                 }
                 None => {
-                    // No asset specified or not found in the release — fall back to git clone
-                    self.install_from_git_clone(&meta, &tmp_path, repo).await
+                    self.install_from_git_clone(&meta, &tmp_path, repo).await?;
                 }
-            };
+            }
+
+            if meta.create_desktop {
+                self.install_desktop_entry(&meta, pkg_name, &tmp_path).await?;
+            }
+            return Ok(());
         }
 
         // Repo-hosted source
@@ -276,7 +304,99 @@ impl VlManager {
             .await?;
         fs::write(&dest, &bytes)?;
         println!("  {} downloaded ({} KB)", file, bytes.len() / 1024);
-        self.run_install(&meta, &dest, &tmp_path).await
+        self.run_install(&meta, &dest, &tmp_path).await?;
+        if meta.create_desktop {
+            self.install_desktop_entry(&meta, pkg_name, &tmp_path).await?;
+        }
+        Ok(())
+    }
+
+    async fn install_desktop_entry(
+        &self,
+        meta: &PkgJson,
+        pkg_name: &str,
+        tmp_path: &PathBuf,
+    ) -> Result<()> {
+        println!("\x1b[32m==> Creating desktop entry…\x1b[0m");
+
+        let app_name = meta.desktop_name.as_deref().unwrap_or(&meta.name);
+        let comment = meta
+            .desktop_comment
+            .as_deref()
+            .or(meta.description.as_deref())
+            .unwrap_or("");
+        let categories = meta.desktop_categories.as_deref().unwrap_or("Application;");
+        let exec = meta
+            .desktop_exec
+            .as_deref()
+            .or(meta.rename_file.as_deref())
+            .unwrap_or(&meta.name);
+
+        // Download and install icon if one is specified in pkg.json
+        let icon_value = if let Some(icon_file) = &meta.icon {
+            let icon_url = format!("{}/{}/{}", REPO_RAW, pkg_name, icon_file);
+            let icon_bytes = self
+                .client
+                .get(&icon_url)
+                .send()
+                .await
+                .context("Failed to fetch icon from repo")?
+                .error_for_status()
+                .with_context(|| format!("Icon '{}' not found in VL repo", icon_file))?
+                .bytes()
+                .await?;
+
+            let tmp_icon = tmp_path.join(icon_file);
+            fs::write(&tmp_icon, &icon_bytes)?;
+
+            let icon_dest = format!("/usr/share/pixmaps/{}", icon_file);
+            let status = Command::new("pkexec")
+                .args([
+                    "install",
+                    "-m",
+                    "644",
+                    tmp_icon.to_str().unwrap_or(""),
+                    &icon_dest,
+                ])
+                .status()
+                .await
+                .context("pkexec not found")?;
+            if !status.success() {
+                anyhow::bail!("Failed to install icon to {}", icon_dest);
+            }
+            println!("  Icon installed → {}", icon_dest);
+            icon_dest
+        } else {
+            // No icon specified — reference by app name so the DE can look it up in its icon theme
+            meta.name.clone()
+        };
+
+        let desktop_content = format!(
+            "[Desktop Entry]\nName={}\nComment={}\nExec={}\nIcon={}\nType=Application\nCategories={}\n",
+            app_name, comment, exec, icon_value, categories
+        );
+
+        let desktop_filename = format!("{}.desktop", meta.name);
+        let tmp_desktop = tmp_path.join(&desktop_filename);
+        fs::write(&tmp_desktop, &desktop_content)?;
+
+        let dest = format!("/usr/share/applications/{}", desktop_filename);
+        let status = Command::new("pkexec")
+            .args([
+                "install",
+                "-m",
+                "644",
+                tmp_desktop.to_str().unwrap_or(""),
+                &dest,
+            ])
+            .status()
+            .await
+            .context("pkexec not found")?;
+        if !status.success() {
+            anyhow::bail!("Failed to install desktop file to {}", dest);
+        }
+        println!("  Desktop entry installed → {}", dest);
+        Ok(())
     }
 
     /// Install a file that has already been downloaded to `dest`.
