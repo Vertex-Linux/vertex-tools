@@ -25,7 +25,7 @@ impl Manager for PacmanManager {
 
     async fn install(&self, packages: &[String]) -> Result<()> {
         let status = Command::new("pkexec")
-            .args(["pacman", "-S", "--noconfirm"])
+            .args(["pacman", "-S"])
             .args(packages)
             .status()
             .await
