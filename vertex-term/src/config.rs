@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn default_true() -> bool { true }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub theme: String,
@@ -13,6 +15,9 @@ pub struct Config {
     pub opacity: f32,
     pub cursor_blink: bool,
     pub enable_blur: bool,
+    /// Whether the top toolbar is visible. Toggled with Ctrl+Shift+B.
+    #[serde(default = "default_true")]
+    pub show_topbar: bool,
 }
 
 impl Default for Config {
@@ -27,6 +32,7 @@ impl Default for Config {
             opacity: 1.0,
             cursor_blink: true,
             enable_blur: false,
+            show_topbar: true,
         }
     }
 }

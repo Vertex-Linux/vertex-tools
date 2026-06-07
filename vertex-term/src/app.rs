@@ -35,8 +35,33 @@ pub struct VertexTerm {
     clipboard: Option<arboard::Clipboard>,
 }
 
+fn load_fallback_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Ordered by Unicode coverage priority.  Symbols2 covers braille (U+2800–U+28FF),
+    // block elements, box-drawing, dingbats, and many TUI-specific ranges.
+    let candidates: &[(&str, &str)] = &[
+        ("noto-symbols2", "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf"),
+        ("noto-symbols",  "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf"),
+        ("noto-sans",     "/usr/share/fonts/noto/NotoSans-Regular.ttf"),
+    ];
+
+    for (name, path) in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(name.to_string(), egui::FontData::from_owned(bytes));
+            for family in [&egui::FontFamily::Monospace, &egui::FontFamily::Proportional] {
+                fonts.families.entry(family.clone()).or_default().push(name.to_string());
+            }
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
 impl VertexTerm {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        load_fallback_fonts(&cc.egui_ctx);
+
         // Create ~/.vertex-term/themes/ and seed example files on first run.
         theme::init_user_theme_dir();
 
@@ -104,10 +129,9 @@ impl VertexTerm {
         let font_size = self.config.font_size;
         let font_id   = FontId::new(font_size, FontFamily::Monospace);
 
-        // Use the real egui font row-height so show_rows virtualisation and our
-        // pixel→cell maths both agree with what's actually rendered.
-        let cell_h = ctx.fonts(|f| f.row_height(&font_id));
-        let cell_w = font_size * 0.601;
+        // Measure both dimensions from the real font so column count and
+        // pixel→cell maths agree exactly with what's rendered.
+        let (cell_w, cell_h) = ctx.fonts(|f| (f.glyph_width(&font_id, 'X'), f.row_height(&font_id)));
         let cell_sz = Vec2::new(cell_w, cell_h);
 
         let avail = ui.available_size();
@@ -303,6 +327,17 @@ impl VertexTerm {
                         ui.checkbox(&mut self.config.cursor_blink, "");
                         ui.end_row();
 
+                        ui.label("Show toolbar");
+                        ui.vertical(|ui| {
+                            ui.checkbox(&mut self.config.show_topbar, "");
+                            ui.label(
+                                egui::RichText::new("Ctrl+Shift+B to toggle anytime")
+                                    .small()
+                                    .color(dim(self.theme.fg(), 0.6)),
+                            );
+                        });
+                        ui.end_row();
+
                         ui.label("Scrollback lines");
                         ui.add(egui::Slider::new(&mut self.config.scrollback_lines, 100..=50000));
                         ui.end_row();
@@ -378,6 +413,11 @@ impl VertexTerm {
                     egui::Event::Copy => {
                         self.pty.write_bytes(&[0x03]);
                         self.terminal.scroll_offset = 0;
+                    }
+                    egui::Event::Key { key: Key::B, pressed: true, modifiers, .. }
+                        if modifiers.ctrl && modifiers.shift => {
+                        self.config.show_topbar = !self.config.show_topbar;
+                        self.config.save();
                     }
                     egui::Event::Key { key, pressed: true, modifiers, .. } => {
                         let bytes = key_to_bytes(*key, *modifiers);
@@ -563,42 +603,44 @@ impl eframe::App for VertexTerm {
             .fill(dim(bg, 0.85))
             .inner_margin(Margin::symmetric(8.0, 4.0));
 
-        if !self.config.system_borders {
-            // CSD mode: draw our own title bar and make it draggable.
-            egui::TopBottomPanel::top("titlebar")
-                .frame(toolbar_frame)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        // Drag region — takes all space not used by buttons.
-                        let drag_resp = ui.interact(
-                            ui.available_rect_before_wrap(),
-                            egui::Id::new("titlebar_drag"),
-                            egui::Sense::click_and_drag(),
-                        );
-                        ui.label(egui::RichText::new("  Vertex Term").color(fg).strong());
-                        if drag_resp.drag_started() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(" ✕ ").clicked() { std::process::exit(0); }
-                            if ui.button(" ⚙ ").clicked() {
+        if self.config.show_topbar {
+            if !self.config.system_borders {
+                // CSD mode: draw our own title bar and make it draggable.
+                egui::TopBottomPanel::top("titlebar")
+                    .frame(toolbar_frame)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            // Drag region — takes all space not used by buttons.
+                            let drag_resp = ui.interact(
+                                ui.available_rect_before_wrap(),
+                                egui::Id::new("titlebar_drag"),
+                                egui::Sense::click_and_drag(),
+                            );
+                            ui.label(egui::RichText::new("  Vertex Term").color(fg).strong());
+                            if drag_resp.drag_started() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(" ✕ ").clicked() { std::process::exit(0); }
+                                if ui.button(" ⚙ ").clicked() {
+                                    self.show_settings = !self.show_settings;
+                                    if self.show_settings { self.open_settings(); }
+                                }
+                            });
+                        });
+                    });
+            } else {
+                egui::TopBottomPanel::top("toolbar")
+                    .frame(toolbar_frame)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("⚙ Settings").clicked() {
                                 self.show_settings = !self.show_settings;
                                 if self.show_settings { self.open_settings(); }
                             }
                         });
                     });
-                });
-        } else {
-            egui::TopBottomPanel::top("toolbar")
-                .frame(toolbar_frame)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("⚙ Settings").clicked() {
-                            self.show_settings = !self.show_settings;
-                            if self.show_settings { self.open_settings(); }
-                        }
-                    });
-                });
+            }
         }
 
         egui::CentralPanel::default()
