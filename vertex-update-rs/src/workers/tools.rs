@@ -1,4 +1,4 @@
-use crate::constants::{DRIVERS_API, SELF_RELEASES_API, VPKG_RELEASES_API};
+use crate::constants::{DRIVERS_API, SELF_RELEASES_API, VPKG_RELEASES_API, VT_RELEASES_API};
 use crate::net::{fetch_bytes, fetch_json};
 use crate::workers::Msg;
 use eframe::egui;
@@ -15,6 +15,7 @@ pub fn run(
     do_vpkg: bool,
     do_self: bool,
     do_calla: bool,
+    do_vterm: bool,
 ) {
     std::thread::spawn(move || {
         macro_rules! log {
@@ -75,6 +76,24 @@ pub fn run(
                 }
                 Err(e) => {
                     log!("  [error] vertex-update: {e}");
+                    errors += 1;
+                }
+            }
+        }
+
+        if do_vterm {
+            log!("Fetching latest vertex-term release…");
+            match fetch_vterm() {
+                Ok(Some((src, dst, tag, kb))) => {
+                    log!("  vertex-term {tag} ready  ({kb} KB)");
+                    files.push((src, dst));
+                }
+                Ok(None) => {
+                    log!("  [error] No release tagged with -vt found, or asset missing");
+                    errors += 1;
+                }
+                Err(e) => {
+                    log!("  [error] vertex-term: {e}");
                     errors += 1;
                 }
             }
@@ -353,6 +372,45 @@ fn fetch_self_update() -> anyhow::Result<Option<(String, String, String, usize)>
             let kb = bytes.len() / 1024;
             let tmp = write_tmp("vertex-update-", &bytes)?;
             Ok(Some((tmp, "/usr/local/bin/vertex-update".into(), tag, kb)))
+        }
+    }
+}
+
+fn fetch_vterm() -> anyhow::Result<Option<(String, String, String, usize)>> {
+    let releases = fetch_json(VT_RELEASES_API)?;
+    let release = releases
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|r| r["tag_name"].as_str().map(|t| t.ends_with("-vt")).unwrap_or(false))
+        })
+        .cloned();
+
+    let release = match release {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    let tag = release["tag_name"].as_str().unwrap_or("?").to_string();
+    let arch = std::env::consts::ARCH;
+    let asset_name = format!("vertex-term-{arch}-unknown-linux-gnu");
+
+    let url = release["assets"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|a| a["name"].as_str() == Some(asset_name.as_str()))
+                .and_then(|a| a["browser_download_url"].as_str())
+        })
+        .map(str::to_string);
+
+    match url {
+        None => Ok(None),
+        Some(url) => {
+            let bytes = fetch_bytes(&url)?;
+            let kb = bytes.len() / 1024;
+            let tmp = write_tmp("vertex-term-", &bytes)?;
+            Ok(Some((tmp, "/usr/local/bin/vertex-term".into(), tag, kb)))
         }
     }
 }

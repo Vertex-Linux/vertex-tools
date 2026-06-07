@@ -14,5 +14,9 @@ pub const VPKG_RELEASES_API: &str =
 pub const SELF_RELEASES_API: &str =
     "https://api.github.com/repos/Vertex-Linux/vertex-tools/releases";
 
+// Scanned for the first release whose tag ends with "-vt"
+pub const VT_RELEASES_API: &str =
+    "https://api.github.com/repos/Vertex-Linux/vertex-tools/releases";
+
 pub const VERSION_FILE: &str = "/etc/vertex-release";
 pub const USER_AGENT: &str = "VertexUpdater/2.0";

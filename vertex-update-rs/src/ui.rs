@@ -97,6 +97,13 @@ fn render_tools(ui: &mut Ui, app: &mut App, ctx: &egui::Context) {
             RichText::new("Calla Desktop  (vpkg vl install calla --no-deps)")
                 .color(colors::TEXT_SEC),
         );
+        ui.checkbox(
+            &mut app.chk_vterm,
+            RichText::new(
+                "Vertex Term  (arc360alt/vertex-tools — latest release tagged -vt)",
+            )
+            .color(colors::TEXT_SEC),
+        );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!app.busy, |ui| {
