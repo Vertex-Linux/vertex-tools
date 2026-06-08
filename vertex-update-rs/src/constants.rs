@@ -18,5 +18,8 @@ pub const SELF_RELEASES_API: &str =
 pub const VT_RELEASES_API: &str =
     "https://api.github.com/repos/Vertex-Linux/vertex-tools/releases";
 
+pub const VSTORE_RELEASES_API: &str =
+    "https://api.github.com/repos/Vertex-Linux/vertex-appstore/releases/latest";
+
 pub const VERSION_FILE: &str = "/etc/vertex-release";
 pub const USER_AGENT: &str = "VertexUpdater/2.0";

@@ -104,6 +104,11 @@ fn render_tools(ui: &mut Ui, app: &mut App, ctx: &egui::Context) {
             )
             .color(colors::TEXT_SEC),
         );
+        ui.checkbox(
+            &mut app.chk_vstore,
+            RichText::new("Vertex Store  (Vertex-Linux/vertex-appstore — latest release)")
+                .color(colors::TEXT_SEC),
+        );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!app.busy, |ui| {

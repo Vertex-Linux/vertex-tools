@@ -1,4 +1,4 @@
-use crate::constants::{DRIVERS_API, SELF_RELEASES_API, VPKG_RELEASES_API, VT_RELEASES_API};
+use crate::constants::{DRIVERS_API, SELF_RELEASES_API, VPKG_RELEASES_API, VT_RELEASES_API, VSTORE_RELEASES_API};
 use crate::net::{fetch_bytes, fetch_json};
 use crate::workers::Msg;
 use eframe::egui;
@@ -16,6 +16,7 @@ pub fn run(
     do_self: bool,
     do_calla: bool,
     do_vterm: bool,
+    do_vstore: bool,
 ) {
     std::thread::spawn(move || {
         macro_rules! log {
@@ -94,6 +95,24 @@ pub fn run(
                 }
                 Err(e) => {
                     log!("  [error] vertex-term: {e}");
+                    errors += 1;
+                }
+            }
+        }
+
+        if do_vstore {
+            log!("Fetching latest vertex-store release…");
+            match fetch_vstore() {
+                Ok(Some((src, dst, tag, kb))) => {
+                    log!("  vertex-store {tag} ready  ({kb} KB)");
+                    files.push((src, dst));
+                }
+                Ok(None) => {
+                    log!("  [error] 'vertex-store-linux-x86_64' asset not found in latest release");
+                    errors += 1;
+                }
+                Err(e) => {
+                    log!("  [error] vertex-store: {e}");
                     errors += 1;
                 }
             }
@@ -372,6 +391,29 @@ fn fetch_self_update() -> anyhow::Result<Option<(String, String, String, usize)>
             let kb = bytes.len() / 1024;
             let tmp = write_tmp("vertex-update-", &bytes)?;
             Ok(Some((tmp, "/usr/local/bin/vertex-update".into(), tag, kb)))
+        }
+    }
+}
+
+fn fetch_vstore() -> anyhow::Result<Option<(String, String, String, usize)>> {
+    let data = fetch_json(VSTORE_RELEASES_API)?;
+    let tag = data["tag_name"].as_str().unwrap_or("?").to_string();
+    let url = data["assets"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|a| a["name"].as_str() == Some("vertex-store-linux-x86_64"))
+                .and_then(|a| a["browser_download_url"].as_str())
+        })
+        .map(str::to_string);
+
+    match url {
+        None => Ok(None),
+        Some(url) => {
+            let bytes = fetch_bytes(&url)?;
+            let kb = bytes.len() / 1024;
+            let tmp = write_tmp("vertex-store-", &bytes)?;
+            Ok(Some((tmp, "/usr/bin/vertex-store".into(), tag, kb)))
         }
     }
 }

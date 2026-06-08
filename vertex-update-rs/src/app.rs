@@ -60,6 +60,7 @@ pub struct App {
     pub chk_self: bool,
     pub chk_calla: bool,
     pub chk_vterm: bool,
+    pub chk_vstore: bool,
 
     // OS update state
     pub os_installed: String,
@@ -96,6 +97,7 @@ impl App {
             chk_self: true,
             chk_calla: true,
             chk_vterm: true,
+            chk_vstore: true,
             os_installed: read_version(),
             os_info: None,
             os_state: OsState::NotChecked,
@@ -236,7 +238,7 @@ impl App {
     }
 
     pub fn start_tool_updates(&mut self, ctx: &egui::Context) {
-        if !self.chk_drivers && !self.chk_vpkg && !self.chk_self && !self.chk_calla && !self.chk_vterm {
+        if !self.chk_drivers && !self.chk_vpkg && !self.chk_self && !self.chk_calla && !self.chk_vterm && !self.chk_vstore {
             self.log.push_str("No tools selected.\n");
             return;
         }
@@ -252,6 +254,7 @@ impl App {
             self.chk_self,
             self.chk_calla,
             self.chk_vterm,
+            self.chk_vstore,
         );
     }
 
