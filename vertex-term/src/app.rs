@@ -547,6 +547,11 @@ impl eframe::App for VertexTerm {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_pty_output();
 
+        // Shell exited (e.g. the `exit` command) — close the whole terminal with it.
+        if self.pty.has_exited() {
+            std::process::exit(0);
+        }
+
         // Detect right-click via raw events — reliable even when label widgets
         // consume the secondary pointer click for their own text-selection sense.
         let right_click_pos = ctx.input(|i| {
@@ -686,6 +691,13 @@ impl eframe::App for VertexTerm {
                             }
                             self.sel_start = None;
                             self.sel_end   = None;
+                            close_ctx_menu = true;
+                        }
+                        ui.separator();
+                        let topbar_label = if self.config.show_topbar { "Hide Topbar" } else { "Show Topbar" };
+                        if ui.button(topbar_label).clicked() {
+                            self.config.show_topbar = !self.config.show_topbar;
+                            self.config.save();
                             close_ctx_menu = true;
                         }
                         ui.separator();

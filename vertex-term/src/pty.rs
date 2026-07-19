@@ -1,12 +1,15 @@
 use anyhow::Result;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct Pty {
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
     pub output: Arc<Mutex<Vec<u8>>>,
+    /// Set by the reader thread once the shell's PTY reports EOF (shell exited).
+    exited: Arc<AtomicBool>,
 }
 
 impl Pty {
@@ -25,6 +28,8 @@ impl Pty {
 
         let output = Arc::new(Mutex::new(Vec::<u8>::new()));
         let output_clone = Arc::clone(&output);
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_clone = Arc::clone(&exited);
 
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -37,9 +42,15 @@ impl Pty {
                     }
                 }
             }
+            exited_clone.store(true, Ordering::Relaxed);
         });
 
-        Ok(Self { master: pair.master, writer, output })
+        Ok(Self { master: pair.master, writer, output, exited })
+    }
+
+    /// True once the shell process has exited (its PTY reader hit EOF).
+    pub fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::Relaxed)
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
