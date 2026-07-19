@@ -300,7 +300,7 @@ impl VertexTerm {
                         ui.end_row();
 
                         ui.label("Font size");
-                        ui.add(egui::Slider::new(&mut self.config.font_size, 8.0..=32.0).suffix(" px"));
+                        ui.add(egui::Slider::new(&mut self.config.font_size, 8.0..=32.0).step_by(1.0).integer().suffix(" px"));
                         ui.end_row();
 
                         ui.label("Opacity");
