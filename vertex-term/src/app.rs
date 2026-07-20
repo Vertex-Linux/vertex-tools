@@ -144,7 +144,7 @@ impl VertexTerm {
 
         let total_lines = self.terminal.scrollback.len() + self.terminal.rows;
         let theme        = self.theme.clone();
-        let cursor_visible = self.cursor_visible;
+        let cursor_visible = self.cursor_visible && self.terminal.cursor_visible;
         let opacity      = self.config.opacity;
         let sel          = self.normalized_selection();
 

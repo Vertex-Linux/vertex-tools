@@ -56,6 +56,17 @@ pub struct Terminal {
     // DEC private mode: set when shell sends \x1b[?2004h
     pub bracketed_paste: bool,
 
+    // DEC private mode 25 (DECTCEM): whether the app wants the cursor drawn at all.
+    pub cursor_visible: bool,
+
+    // Alternate screen buffer (DEC private modes 47/1049), used by full-screen
+    // TUI apps (ratatui/crossterm, vim, less, htop, ...) so they can repaint
+    // freely without disturbing scrollback, then hand the original screen back
+    // untouched on exit.
+    in_alt_screen: bool,
+    saved_grid: Option<Vec<Vec<Cell>>>,
+    saved_cursor: Option<(usize, usize)>,
+
     // Pending byte buffer (for multi-byte UTF-8 from PTY reads)
     pub pending: Vec<u8>,
 }
@@ -80,6 +91,10 @@ impl Terminal {
             saved_col: 0,
             saved_row: 0,
             bracketed_paste: false,
+            cursor_visible: true,
+            in_alt_screen: false,
+            saved_grid: None,
+            saved_cursor: None,
             pending: Vec::new(),
         }
     }
@@ -91,8 +106,46 @@ impl Terminal {
             row.resize(cols, Cell::default());
         }
         self.grid.resize(rows, vec![Cell::default(); cols]);
+        // Keep the off-screen buffer in sync too, so it's still the right shape
+        // if the app leaves the alt screen after a resize.
+        if let Some(saved) = &mut self.saved_grid {
+            for row in saved.iter_mut() {
+                row.resize(cols, Cell::default());
+            }
+            saved.resize(rows, vec![Cell::default(); cols]);
+        }
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+    }
+
+    /// DEC private mode 47/1049 set: switch to a blank alternate screen,
+    /// stashing the primary screen's contents and cursor to restore later.
+    fn enter_alt_screen(&mut self) {
+        if self.in_alt_screen { return; }
+        self.in_alt_screen = true;
+        self.saved_grid = Some(std::mem::replace(
+            &mut self.grid,
+            vec![vec![Cell::default(); self.cols]; self.rows],
+        ));
+        self.saved_cursor = Some((self.cursor_row, self.cursor_col));
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.scroll_offset = 0;
+    }
+
+    /// DEC private mode 47/1049 reset: hand the primary screen back exactly
+    /// as the full-screen app found it.
+    fn leave_alt_screen(&mut self) {
+        if !self.in_alt_screen { return; }
+        self.in_alt_screen = false;
+        if let Some(grid) = self.saved_grid.take() {
+            self.grid = grid;
+        }
+        if let Some((row, col)) = self.saved_cursor.take() {
+            self.cursor_row = row.min(self.rows.saturating_sub(1));
+            self.cursor_col = col.min(self.cols.saturating_sub(1));
+        }
+        self.scroll_offset = 0;
     }
 
     fn current_cell(&self) -> Cell {
@@ -111,6 +164,10 @@ impl Terminal {
         let row = std::mem::replace(&mut self.grid[0], vec![Cell::default(); self.cols]);
         self.grid.remove(0);
         self.grid.push(vec![Cell::default(); self.cols]);
+
+        // Full-screen apps (TUIs) repaint the whole screen themselves and don't
+        // expect their internal scrolling to leak into the primary scrollback.
+        if self.in_alt_screen { return; }
 
         if self.scrollback.len() >= self.scrollback_limit {
             self.scrollback.remove(0);
@@ -235,13 +292,22 @@ impl Perform for Terminal {
         let p0 = *p.first().unwrap_or(&0) as usize;
         let p1 = *p.get(1).unwrap_or(&0) as usize;
 
-        // DEC private modes: \x1b[?<n>h / \x1b[?<n>l
+        // DEC private modes: \x1b[?<n>h / \x1b[?<n>l — a single escape can set/reset
+        // several modes at once (e.g. \x1b[?1000;1002;1003;1006h for mouse tracking),
+        // so walk every code rather than just the first.
         if intermediates.first() == Some(&b'?') {
-            match (action, p0) {
-                ('h', 2004) => { self.bracketed_paste = true; return; }
-                ('l', 2004) => { self.bracketed_paste = false; return; }
-                _ => { return; }
+            let enable = action == 'h';
+            for &code in &p {
+                match code {
+                    25 => self.cursor_visible = enable,
+                    47 | 1047 | 1049 => {
+                        if enable { self.enter_alt_screen(); } else { self.leave_alt_screen(); }
+                    }
+                    2004 => self.bracketed_paste = enable,
+                    _ => {}
+                }
             }
+            return;
         }
 
         match action {
