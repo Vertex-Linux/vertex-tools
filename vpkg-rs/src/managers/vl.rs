@@ -55,6 +55,13 @@ pub enum InstallType {
     Makepkg,
     /// Copy the file directly to `/usr/local/bin/<name>` and `chmod +x`.
     Binary,
+    /// Extract the downloaded archive (or use the git clone) and run a script
+    /// inside it, e.g. `install.sh`.
+    Script,
+}
+
+fn default_log() -> bool {
+    true
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -85,6 +92,22 @@ pub struct PkgJson {
     /// If set, find the latest release whose tag *contains* this string.
     /// If omitted, the very latest release is used.
     pub github_tag_keyword: Option<String>,
+
+    /// Pick the first release asset whose filename ends with this extension
+    /// (e.g. `"tar.gz"`, `"tar.zst"`, `"zip"`) instead of naming an exact file
+    /// with `github_asset`. Handy when the asset name embeds the version
+    /// number and you don't want to hardcode it.
+    pub ext: Option<String>,
+
+    // ── Script install (type = "script") ─────────────────────────────────────
+    /// Filename of the script to run after extracting the archive (or inside
+    /// the cloned repo, if there's no release asset). Runs with the script's
+    /// own shebang from the directory it was found in, e.g. `"install.sh"`.
+    pub script: Option<String>,
+
+    /// Whether to show the script's stdout/stderr as it runs. Defaults to true.
+    #[serde(default = "default_log")]
+    pub log: bool,
 
     // ── Rename ────────────────────────────────────────────────────────────────
     /// For `binary` installs: rename the downloaded/cloned file to this before
@@ -224,6 +247,23 @@ impl VlManager {
         Some((asset.browser_download_url.clone(), asset_name.to_string()))
     }
 
+    /// Find the first release asset whose filename ends with `ext` (e.g. `"tar.gz"`).
+    /// Returns `None` if the release or a matching asset doesn't exist (soft failure).
+    async fn try_find_asset_by_ext(
+        &self,
+        repo: &str,
+        ext: &str,
+        tag_keyword: Option<&str>,
+    ) -> Option<(String /* url */, String /* filename */)> {
+        let release = self.resolve_gh_release(repo, tag_keyword).await.ok()?;
+        let suffix = format!(".{}", ext.trim_start_matches('.').to_lowercase());
+        let asset = release
+            .assets
+            .iter()
+            .find(|a| a.name.to_lowercase().ends_with(&suffix))?;
+        Some((asset.browser_download_url.clone(), asset.name.clone()))
+    }
+
     // ── Install dispatch ──────────────────────────────────────────────────────
 
     async fn download_and_install(&self, pkg_name: &str) -> Result<()> {
@@ -242,10 +282,14 @@ impl VlManager {
                 .as_deref()
                 .with_context(|| format!("pkg.json for '{}' is missing 'github_repo'", pkg_name))?;
 
-            // Try to resolve a release asset when one is specified
+            // Try to resolve a release asset when one is specified — an exact
+            // filename (`github_asset`) takes priority over a by-extension
+            // match (`ext`).
             let asset_result = if let Some(tmpl) = &meta.github_asset {
                 let asset_name = tmpl.replace("{arch}", std::env::consts::ARCH);
                 self.try_find_asset(repo, &asset_name, meta.github_tag_keyword.as_deref()).await
+            } else if let Some(ext) = &meta.ext {
+                self.try_find_asset_by_ext(repo, ext, meta.github_tag_keyword.as_deref()).await
             } else {
                 None
             };
@@ -440,6 +484,74 @@ impl VlManager {
                 }
                 println!("  Installed {} → {}", bin_name, dest_bin);
             }
+            InstallType::Script => {
+                let script_name = meta.script.as_deref().with_context(|| {
+                    format!("pkg.json for '{}' is missing 'script' (required for type=script)", meta.name)
+                })?;
+                println!("\x1b[32m==> Extracting {}…\x1b[0m", dest.display());
+                self.extract_archive(dest, tmp_path).await?;
+                let script_dir = find_file_dir(tmp_path, script_name).with_context(|| {
+                    format!("'{}' not found after extracting {}", script_name, dest.display())
+                })?;
+                self.run_script(&script_dir, script_name, meta.log).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Extract an archive into `dest`. Dispatches on the file's extension:
+    /// `.zip` goes through `unzip`, everything else (`.tar.gz`, `.tar.zst`,
+    /// `.tar.xz`, plain `.tar`, …) goes through `tar`, which auto-detects the
+    /// compression from the archive itself.
+    async fn extract_archive(&self, archive: &PathBuf, dest: &PathBuf) -> Result<()> {
+        let name = archive.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let status = if name.to_lowercase().ends_with(".zip") {
+            Command::new("unzip")
+                .args(["-q", archive.to_str().unwrap_or(""), "-d", dest.to_str().unwrap_or("")])
+                .status()
+                .await
+                .context("unzip not found — install with: vpkg pm install unzip")?
+        } else {
+            Command::new("tar")
+                .args(["-xf", archive.to_str().unwrap_or(""), "-C", dest.to_str().unwrap_or("")])
+                .status()
+                .await
+                .context("tar not found")?
+        };
+        if !status.success() {
+            anyhow::bail!("Failed to extract {}", archive.display());
+        }
+        Ok(())
+    }
+
+    /// Make `<dir>/<script_name>` executable and run it in place, honoring its
+    /// own shebang. `log` controls whether its stdout/stderr are shown.
+    async fn run_script(&self, dir: &PathBuf, script_name: &str, log: bool) -> Result<()> {
+        let script_path = dir.join(script_name);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(&script_path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(perms.mode() | 0o111);
+                let _ = fs::set_permissions(&script_path, perms);
+            }
+        }
+
+        println!("\x1b[32m==> Running {}…\x1b[0m", script_name);
+        let mut cmd = Command::new(&script_path);
+        cmd.current_dir(dir);
+        if !log {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+        let status = cmd
+            .status()
+            .await
+            .with_context(|| format!("Failed to execute {}", script_path.display()))?;
+        if !status.success() {
+            anyhow::bail!("'{}' exited with an error", script_name);
         }
         Ok(())
     }
@@ -505,6 +617,15 @@ impl VlManager {
                 }
                 println!("  Installed {} → {}", bin_name, dest_bin);
             }
+            InstallType::Script => {
+                let script_name = meta.script.as_deref().with_context(|| {
+                    format!("pkg.json for '{}' is missing 'script' (required for type=script)", meta.name)
+                })?;
+                let script_dir = find_file_dir(&clone_dir, script_name).with_context(|| {
+                    format!("'{}' not found in cloned repo {}", script_name, repo)
+                })?;
+                self.run_script(&script_dir, script_name, meta.log).await?;
+            }
             InstallType::Pacman => {
                 anyhow::bail!(
                     "pacman install type requires a release asset — \
@@ -548,6 +669,25 @@ impl VlManager {
         }
         Ok(())
     }
+}
+
+/// Find the directory (root, or one level of subfolders — e.g. the wrapper
+/// folder a tarball extracts into) containing `filename`.
+fn find_file_dir(root: &PathBuf, filename: &str) -> Result<PathBuf> {
+    if root.join(filename).exists() {
+        return Ok(root.clone());
+    }
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() && path.join(filename).exists() {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!(
+        "'{}' not found in {} (searched top level and immediate subfolders)",
+        filename,
+        root.display()
+    )
 }
 
 fn find_pkgbuild_dir(root: &PathBuf) -> Result<PathBuf> {
